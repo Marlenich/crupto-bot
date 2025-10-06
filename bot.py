@@ -33,26 +33,29 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
         symbol TEXT NOT NULL,
-        target_price REAL NOT NULL
+        target_price REAL NOT NULL,
+        current_price REAL NOT NULL,
+        alert_type TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
     conn.commit()
     conn.close()
     print("✅ База данных готова")
 
-def add_alert(user_id, symbol, target_price):
+def add_alert(user_id, symbol, target_price, current_price, alert_type):
     conn = sqlite3.connect('alerts.db', check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute('INSERT INTO alerts (user_id, symbol, target_price) VALUES (?, ?, ?)',
-                   (user_id, symbol.upper(), target_price))
+    cursor.execute('INSERT INTO alerts (user_id, symbol, target_price, current_price, alert_type) VALUES (?, ?, ?, ?, ?)',
+                   (user_id, symbol.upper(), target_price, current_price, alert_type))
     conn.commit()
     conn.close()
-    print(f"✅ Добавлен алерт: {symbol} -> ${target_price} для пользователя {user_id}")
+    print(f"✅ Добавлен алерт: {symbol} {alert_type} ${target_price} (сейчас: ${current_price})")
 
 def get_all_alerts():
     conn = sqlite3.connect('alerts.db', check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute('SELECT id, user_id, symbol, target_price FROM alerts')
+    cursor.execute('SELECT id, user_id, symbol, target_price, current_price, alert_type FROM alerts')
     all_alerts = cursor.fetchall()
     conn.close()
     return all_alerts
@@ -68,7 +71,7 @@ def delete_alert(alert_id):
 def get_user_alerts(user_id):
     conn = sqlite3.connect('alerts.db', check_same_thread=False)
     cursor = conn.cursor()
-    cursor.execute('SELECT id, symbol, target_price FROM alerts WHERE user_id = ?', (user_id,))
+    cursor.execute('SELECT id, symbol, target_price, alert_type FROM alerts WHERE user_id = ?', (user_id,))
     alerts = cursor.fetchall()
     conn.close()
     return alerts
@@ -82,12 +85,8 @@ def get_current_price(symbol):
             full_symbol = f"{symbol.upper()}USDT"
         
         url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={full_symbol}"
-        print(f"🔍 Запрашиваю цену для: {full_symbol}")
         response = requests.get(url, timeout=10)
         data = response.json()
-        
-        # Отладочная информация
-        print(f"📊 Ответ API: {data}")
         
         # Проверяем структуру ответа
         if data.get('retCode') != 0:
@@ -107,23 +106,36 @@ def get_current_price(symbol):
         ticker = tickers[0]
         current_price = float(ticker['lastPrice'])
         
-        print(f"✅ Цена получена: {full_symbol} = ${current_price}")
         return current_price, full_symbol
         
     except Exception as e:
         print(f"❌ Ошибка получения цены для {symbol}: {e}")
         return None, symbol
 
+def determine_alert_type(current_price, target_price):
+    """Определяем тип алерта: UP (рост) или DOWN (падение)"""
+    if target_price > current_price:
+        return "UP"  # Ждем роста цены
+    else:
+        return "DOWN"  # Ждем падения цены
+
+def should_trigger_alert(current_price, target_price, alert_type):
+    """Определяем, должен ли сработать алерт"""
+    if alert_type == "UP":
+        return current_price >= target_price  # Срабатывает когда цена ВЫРОСЛА до цели
+    else:  # DOWN
+        return current_price <= target_price  # Срабатывает когда цена УПАЛА до цели
+
 # Команды бота
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     print(f"👤 Пользователь {message.from_user.id} запустил бота")
-    bot.reply_to(message, "💰 Привет! Я бот для отслеживания цен крипты.\n\nПросто напиши: BTC 50000\nИ я сообщу когда Bitcoin достигнет $50000")
+    bot.reply_to(message, "💰 Привет! Я бот для отслеживания цен крипты.\n\nПросто напиши: BTC 50000\n\nЯ сам пойму, ждать роста или падения цены! 📈📉")
 
 @bot.message_handler(commands=['status'])
 def status(message):
     alerts_count = len(get_all_alerts())
-    bot.reply_to(message, f"✅ Бот работает на Railway!\nАктивных запросов: {alerts_count}\n\nИспользуй:\n/testalert - тестовый алерт\n/checknow - проверить сейчас\n/myalerts - мои алерты")
+    bot.reply_to(message, f"✅ Бот работает!\nАктивных запросов: {alerts_count}\n\nИспользуй:\n/testalert - тестовый алерт\n/checknow - проверить сейчас\n/myalerts - мои алерты")
 
 @bot.message_handler(commands=['myalerts'])
 def list_alerts(message):
@@ -135,8 +147,9 @@ def list_alerts(message):
     else:
         response = "📋 Твои запросы:\n\n"
         for alert in alerts:
-            id, symbol, price = alert
-            response += f"• {symbol} -> ${price}\n"
+            id, symbol, target_price, alert_type = alert
+            icon = "📈" if alert_type == "UP" else "📉"
+            response += f"• {icon} {symbol} -> ${target_price} ({alert_type})\n"
         bot.send_message(message.chat.id, response)
 
 @bot.message_handler(commands=['testalert'])
@@ -144,17 +157,27 @@ def test_alert(message):
     """Тестовая команда для проверки работы алертов"""
     user_id = message.from_user.id
     try:
-        # Добавляем тестовый алерт с текущей ценой + 1$
         symbol = "BTC"
         current_price, full_symbol = get_current_price(symbol)
         
         if current_price:
-            test_target_price = current_price + 1  # Всего на $1 выше текущей
-            add_alert(user_id, full_symbol, test_target_price)
+            # Создаем два тестовых алерта: один на рост, один на падение
+            test_target_up = current_price + 10  # На $10 выше
+            test_target_down = current_price - 10  # На $10 ниже
             
-            response = f"🧪 ТЕСТОВЫЙ АЛЕРТ!\n\n{full_symbol}\nСейчас: ${current_price:,.2f}\nОповещение при: ${test_target_price:,.2f}\n\nДолжен сработать через 5-10 секунд!"
+            add_alert(user_id, full_symbol, test_target_up, current_price, "UP")
+            add_alert(user_id, full_symbol, test_target_down, current_price, "DOWN")
+            
+            response = f"""🧪 ТЕСТОВЫЕ АЛЕРТЫ!
+
+{full_symbol}
+Сейчас: ${current_price:,.2f}
+
+📈 Алерт на РОСТ: ${test_target_up:,.2f}
+📉 Алерт на ПАДЕНИЕ: ${test_target_down:,.2f}
+
+Слежу за ценой!"""
             bot.reply_to(message, response)
-            print(f"🧪 Создан тестовый алерт: {full_symbol} ${test_target_price}")
         else:
             bot.reply_to(message, "❌ Не удалось получить текущую цену BTC")
             
@@ -173,16 +196,17 @@ def check_now(message):
             bot.reply_to(message, "У тебя нет активных алертов")
             return
             
-        response = "🔍 Проверяю твои алерты:\n\n"
+        response = "🔍 Твои алерты:\n\n"
         for alert in user_alerts:
-            alert_id, user_id, symbol, target_price = alert
-            current_price, _ = get_current_price(symbol)
+            alert_id, user_id, symbol, target_price, current_price, alert_type = alert
+            current_price_now, _ = get_current_price(symbol)
             
-            if current_price:
-                status = "✅ ДОСТИГНУТА!" if current_price >= target_price else "⏳ еще нет"
-                response += f"• {symbol}: ${current_price:,.2f} / ${target_price:,.2f} - {status}\n"
+            if current_price_now:
+                icon = "📈" if alert_type == "UP" else "📉"
+                status = "✅ ГОТОВ!" if should_trigger_alert(current_price_now, target_price, alert_type) else "⏳ жду"
+                response += f"• {icon} {symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} - {status}\n"
             else:
-                response += f"• {symbol}: ошибка получения цены / ${target_price:,.2f}\n"
+                response += f"• {symbol}: ошибка получения цены\n"
         
         bot.reply_to(message, response)
         
@@ -222,15 +246,21 @@ def set_alert(message):
             bot.reply_to(message, f"❌ Тикер '{symbol}' не найден. Попробуй: BTC, ETH, SOL, ADA")
             return
 
-        add_alert(user_id, full_symbol, target_price)
+        # Определяем тип алерта
+        alert_type = determine_alert_type(current_price, target_price)
+        alert_icon = "📈" if alert_type == "UP" else "📉"
+        alert_text = "роста" if alert_type == "UP" else "падения"
+
+        add_alert(user_id, full_symbol, target_price, current_price, alert_type)
         
         response = f"""✅ Алерт установлен!
 
 💠 Монета: {full_symbol}
 💰 Текущая цена: ${current_price:,.2f}
-🎯 Оповещение при: ${target_price:,.2f}
+{alert_icon} Оповещение при: ${target_price:,.2f}
+🎯 Тип: жду {alert_text} цены
 
-Бот проверяет цены каждые 5 секунд."""
+Бот следит за ценой каждые 30 секунд!"""
         
         bot.reply_to(message, response)
         
@@ -242,7 +272,7 @@ def set_alert(message):
 
 # Фоновая проверка цен
 def check_prices():
-    print("🔄 Фоновая проверка цен ЗАПУЩЕНА! (интервал: 5 секунд)")
+    print("🔄 Фоновая проверка цен ЗАПУЩЕНА! (интервал: 30 секунд)")
     while True:
         try:
             all_alerts = get_all_alerts()
@@ -252,33 +282,40 @@ def check_prices():
                 print("🔍 Нет алертов для проверки")
             
             for alert in all_alerts:
-                alert_id, user_id, symbol, target_price = alert
-                print(f"🔍 Проверяю алерт {alert_id}: {symbol} -> ${target_price}")
-                
+                alert_id, user_id, symbol, target_price, initial_price, alert_type = alert
                 current_price, _ = get_current_price(symbol)
 
                 if current_price:
-                    print(f"💰 {symbol}: ${current_price} / ${target_price}")
+                    print(f"💰 {symbol}: ${current_price} / ${target_price} ({alert_type})")
                     
-                    if current_price >= target_price:
-                        print(f"🚨 АЛЕРТ СРАБОТАЛ! {symbol} достиг ${target_price}")
+                    if should_trigger_alert(current_price, target_price, alert_type):
+                        print(f"🚨 АЛЕРТ СРАБОТАЛ! {symbol} {alert_type} ${target_price}")
                         try:
-                            message_text = f"🚀 АЛЕРТ! 🚀\n\n{symbol} достиг цели!\n🎯 Цель: ${target_price:,.2f}\n💰 Текущая цена: ${current_price:,.2f}"
+                            icon = "📈" if alert_type == "UP" else "📉"
+                            direction = "выросла" if alert_type == "UP" else "упала"
+                            message_text = f"""🚀 АЛЕРТ! 🚀
+
+{icon} {symbol} {direction} до цели!
+
+🎯 Цель: ${target_price:,.2f}
+💰 Текущая цена: ${current_price:,.2f}
+
+Алерт выполнен! ✅"""
                             bot.send_message(user_id, message_text)
                             delete_alert(alert_id)
                             print(f"✅ Уведомление отправлено пользователю {user_id}")
                         except Exception as e:
                             print(f"❌ Ошибка отправки: {e}")
                     else:
-                        print(f"⏳ {symbol}: еще не достиг цели")
+                        print(f"⏳ {symbol}: еще не достиг цели ({alert_type})")
                 else:
                     print(f"❌ Не удалось получить цену для {symbol}")
                         
         except Exception as e:
             print(f"❌ Ошибка проверки: {e}")
         
-        print(f"⏰ Жду 5 секунд...")
-        time.sleep(5)  # Только 5 секунд для теста!
+        print(f"⏰ Жду 30 секунд...")
+        time.sleep(30)  # Вернули нормальный интервал
 
 # Запуск
 if __name__ == "__main__":
