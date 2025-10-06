@@ -145,7 +145,7 @@ def should_trigger_alert(current_price, target_price, alert_type):
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     print(f"👤 Пользователь {message.from_user.id} запустил бота")
-    bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипты.\n\nПросто напиши: BTC 50000\n\nЯ сам пойму, ждать роста или падения цены! 📈📉")
+    bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипто монет на Bybit.\n\nПросто напиши: BTC 50000 (пример)\n\nЯ пришлю уведомление когда цена достигент указанных значений")
 
 @bot.message_handler(commands=['status'])
 def status(message):
