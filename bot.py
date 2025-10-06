@@ -10,6 +10,9 @@ print("=== БОТ ЗАПУЩЕН НА RAILWAY ===")
 # Токен бота
 TELEGRAM_BOT_TOKEN = '7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU'
 
+# ID администратора (твой ID)
+ADMIN_ID = 5870642170  # ЗАМЕНИ НА СВОЙ ID
+
 if not TELEGRAM_BOT_TOKEN:
     print("❌ ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
     exit()
@@ -28,6 +31,20 @@ except Exception as e:
 def init_db():
     conn = sqlite3.connect('alerts.db', check_same_thread=False)
     cursor = conn.cursor()
+    
+    # Таблица пользователей
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Таблица алертов
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS alerts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,6 +56,7 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
+    
     conn.commit()
     conn.close()
     print("✅ База данных готова")
@@ -46,6 +64,14 @@ def init_db():
 def add_alert(user_id, symbol, target_price, current_price, alert_type):
     conn = sqlite3.connect('alerts.db', check_same_thread=False)
     cursor = conn.cursor()
+    
+    # Обновляем активность пользователя
+    cursor.execute('''
+    INSERT OR REPLACE INTO users (user_id, last_activity) 
+    VALUES (?, CURRENT_TIMESTAMP)
+    ''', (user_id,))
+    
+    # Добавляем алерт
     cursor.execute('INSERT INTO alerts (user_id, symbol, target_price, current_price, alert_type) VALUES (?, ?, ?, ?, ?)',
                    (user_id, symbol.upper(), target_price, current_price, alert_type))
     conn.commit()
@@ -141,10 +167,29 @@ def should_trigger_alert(current_price, target_price, alert_type):
     else:  # DOWN
         return current_price <= target_price  # Срабатывает когда цена УПАЛА до цели
 
+def is_admin(user_id):
+    """Проверяет, является ли пользователь администратором"""
+    return user_id == ADMIN_ID
+
 # Команды бота
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    print(f"👤 Пользователь {message.from_user.id} запустил бота")
+    user_id = message.from_user.id
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    last_name = message.from_user.last_name
+    
+    # Логируем пользователя (в фоне, пользователь не видит)
+    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('''
+    INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, created_at, last_activity) 
+    VALUES (?, ?, ?, ?, COALESCE((SELECT created_at FROM users WHERE user_id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
+    ''', (user_id, username, first_name, last_name, user_id))
+    conn.commit()
+    conn.close()
+    
+    print(f"👤 Пользователь {user_id} запустил бота")
     bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипто монет на Bybit.\n\nПросто напиши: BTC 50000 (пример)\n\nЯ пришлю уведомление когда цена достигент указанных значений")
 
 @bot.message_handler(commands=['status'])
@@ -156,6 +201,89 @@ def status(message):
     price_info = f"\n💰 BTC сейчас: ${btc_price:,.2f}" if btc_price else ""
     
     bot.send_message(message.chat.id, f"✅ Бот работает!\nАктивных запросов: {alerts_count}{price_info}\n\nИспользуй:\n/testprice - проверить цену\n/checknow - мои алерты\n/myalerts - список алертов")
+
+@bot.message_handler(commands=['stats'])
+def show_stats(message):
+    """Статистика (только для администратора)"""
+    if not is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
+        return
+        
+    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # Количество уникальных пользователей
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM alerts')
+    unique_users = cursor.fetchone()[0]
+    
+    # Общее количество алертов
+    cursor.execute('SELECT COUNT(*) FROM alerts')
+    total_alerts = cursor.fetchone()[0]
+    
+    # Активные пользователи (за последние 7 дней)
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM alerts WHERE created_at > datetime("now", "-7 days")')
+    active_users = cursor.fetchone()[0]
+    
+    conn.close()
+    
+    stats_text = f"""📊 СТАТИСТИКА БОТА:
+
+👥 Всего пользователей: {unique_users}
+🔔 Всего алертов: {total_alerts}
+🎯 Активных пользователей: {active_users}"""
+
+    bot.send_message(message.chat.id, stats_text)
+
+@bot.message_handler(commands=['detailed_stats'])
+def detailed_stats(message):
+    """Детальная статистика (только для администратора)"""
+    if not is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
+        return
+        
+    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # Основная статистика
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users')
+    total_users = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM alerts')
+    total_alerts = cursor.fetchone()[0]
+    
+    # Активные пользователи за разные периоды
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-1 day")')
+    active_1d = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-7 days")')
+    active_7d = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-30 days")')
+    active_30d = cursor.fetchone()[0]
+    
+    # Популярные монеты
+    cursor.execute('SELECT symbol, COUNT(*) as count FROM alerts GROUP BY symbol ORDER BY count DESC LIMIT 5')
+    popular_coins = cursor.fetchall()
+    
+    conn.close()
+    
+    stats_text = f"""📊 ДЕТАЛЬНАЯ СТАТИСТИКА:
+
+👥 Всего пользователей: {total_users}
+🔔 Всего алертов: {total_alerts}
+
+🎯 Активность:
+• За 24 часа: {active_1d} пользователей
+• За 7 дней: {active_7d} пользователей  
+• За 30 дней: {active_30d} пользователей
+
+🏆 Популярные монеты:
+"""
+    
+    for coin, count in popular_coins:
+        stats_text += f"• {coin}: {count} алертов\n"
+    
+    bot.send_message(message.chat.id, stats_text)
 
 @bot.message_handler(commands=['testprice'])
 def test_price(message):
