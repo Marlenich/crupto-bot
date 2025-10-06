@@ -14,7 +14,7 @@ for key, value in os.environ.items():
         print(f"   {key}: {value}")
 
 # Получаем токен
-TELEGRAM_BOT_TOKEN = os.environ.get('7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU')
+TELEGRAM_BOT_TOKEN = '7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU'
 
 print(f"📋 TELEGRAM_BOT_TOKEN: {TELEGRAM_BOT_TOKEN}")
 
