@@ -10,8 +10,8 @@ print("=== БОТ ЗАПУЩЕН НА RAILWAY ===")
 # Токен бота
 TELEGRAM_BOT_TOKEN = '7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU'
 
-# ID администратора (твой ID)
-ADMIN_ID = 5870642170  # ЗАМЕНИ НА СВОЙ ID
+# ID администратора (ЗАМЕНИ НА СВОЙ ID)
+ADMIN_ID = 5870642170  # ЗАМЕНИ НА СВОЙ TELEGRAM ID
 
 if not TELEGRAM_BOT_TOKEN:
     print("❌ ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
@@ -284,6 +284,191 @@ def detailed_stats(message):
         stats_text += f"• {coin}: {count} алертов\n"
     
     bot.send_message(message.chat.id, stats_text)
+
+@bot.message_handler(commands=['userlist'])
+def user_list(message):
+    """Список всех пользователей (только для администратора)"""
+    if not is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
+        return
+        
+    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # Получаем всех пользователей с количеством их алертов
+    cursor.execute('''
+    SELECT u.user_id, u.username, u.first_name, u.last_name, u.created_at, u.last_activity, 
+           COUNT(a.id) as alert_count
+    FROM users u 
+    LEFT JOIN alerts a ON u.user_id = a.user_id 
+    GROUP BY u.user_id 
+    ORDER BY u.created_at DESC
+    ''')
+    users = cursor.fetchall()
+    
+    conn.close()
+    
+    if not users:
+        bot.send_message(message.chat.id, "📭 В базе нет пользователей")
+        return
+    
+    # Разбиваем на части, если пользователей много
+    user_count = len(users)
+    response = f"👥 ВСЕ ПОЛЬЗОВАТЕЛИ: {user_count}\n\n"
+    
+    for i, user in enumerate(users, 1):
+        user_id, username, first_name, last_name, created_at, last_activity, alert_count = user
+        
+        # Форматируем даты
+        created = created_at[:16] if created_at else "неизвестно"
+        last_active = last_activity[:16] if last_activity else "неизвестно"
+        
+        user_info = f"#{i} 👤 ID: {user_id}\n"
+        if username:
+            user_info += f"   @{username}\n"
+        if first_name:
+            user_info += f"   Имя: {first_name}"
+            if last_name:
+                user_info += f" {last_name}"
+            user_info += "\n"
+        user_info += f"   📅 Регистрация: {created}\n"
+        user_info += f"   ⏰ Последняя активность: {last_active}\n"
+        user_info += f"   🔔 Алертов: {alert_count}\n"
+        user_info += "   ───────────────────\n"
+        
+        # Если сообщение становится слишком длинным, отправляем и начинаем новое
+        if len(response + user_info) > 4000:
+            bot.send_message(message.chat.id, response)
+            response = "👥 ПРОДОЛЖЕНИЕ:\n\n" + user_info
+        else:
+            response += user_info
+    
+    bot.send_message(message.chat.id, response)
+
+@bot.message_handler(commands=['userinfo'])
+def user_info(message):
+    """Информация о конкретном пользователе (только для администратора)"""
+    if not is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
+        return
+        
+    try:
+        # Парсим команду: /userinfo 123456789
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.send_message(message.chat.id, "❌ Использование: /userinfo USER_ID\nПример: /userinfo 123456789")
+            return
+            
+        target_user_id = int(parts[1])
+        
+        conn = sqlite3.connect('alerts.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        # Информация о пользователе
+        cursor.execute('SELECT * FROM users WHERE user_id = ?', (target_user_id,))
+        user_data = cursor.fetchone()
+        
+        if not user_data:
+            bot.send_message(message.chat.id, f"❌ Пользователь с ID {target_user_id} не найден")
+            conn.close()
+            return
+        
+        # Алерты пользователя
+        cursor.execute('SELECT symbol, target_price, alert_type, created_at FROM alerts WHERE user_id = ? ORDER BY created_at DESC', (target_user_id,))
+        user_alerts = cursor.fetchall()
+        
+        conn.close()
+        
+        user_id, username, first_name, last_name, created_at, last_activity = user_data
+        
+        response = f"👤 ДЕТАЛЬНАЯ ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ:\n\n"
+        response += f"🆔 ID: {user_id}\n"
+        response += f"👤 Username: @{username if username else 'не указан'}\n"
+        response += f"📛 Имя: {first_name if first_name else 'не указано'}\n"
+        response += f"📛 Фамилия: {last_name if last_name else 'не указана'}\n"
+        response += f"📅 Дата регистрации: {created_at}\n"
+        response += f"⏰ Последняя активность: {last_activity}\n"
+        response += f"🔔 Всего алертов: {len(user_alerts)}\n\n"
+        
+        if user_alerts:
+            response += "📋 ПОСЛЕДНИЕ АЛЕРТЫ:\n"
+            for i, alert in enumerate(user_alerts[:10], 1):  # Показываем последние 10
+                symbol, target_price, alert_type, created_at = alert
+                icon = "📈" if alert_type == "UP" else "📉"
+                response += f"{i}. {icon} {symbol} -> ${target_price:,.2f} ({created_at[:16]})\n"
+            if len(user_alerts) > 10:
+                response += f"\n... и еще {len(user_alerts) - 10} алертов"
+        else:
+            response += "📭 У пользователя нет активных алертов"
+        
+        bot.send_message(message.chat.id, response)
+        
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ USER_ID должен быть числом!")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.message_handler(commands=['recent_users'])
+def recent_users(message):
+    """Недавно зарегистрированные пользователи (только для администратора)"""
+    if not is_admin(message.from_user.id):
+        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
+        return
+        
+    try:
+        # Парсим количество дней: /recent_users 7
+        parts = message.text.split()
+        days = 7  # по умолчанию за 7 дней
+        if len(parts) >= 2:
+            days = int(parts[1])
+        
+        conn = sqlite3.connect('alerts.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+        SELECT user_id, username, first_name, last_name, created_at, 
+               (SELECT COUNT(*) FROM alerts WHERE user_id = users.user_id) as alert_count
+        FROM users 
+        WHERE created_at > datetime("now", "-? days") 
+        ORDER BY created_at DESC
+        ''', (days,))
+        
+        recent_users = cursor.fetchall()
+        conn.close()
+        
+        if not recent_users:
+            bot.send_message(message.chat.id, f"📭 Нет новых пользователей за последние {days} дней")
+            return
+        
+        response = f"🆕 ПОЛЬЗОВАТЕЛИ ЗА ПОСЛЕДНИЕ {days} ДНЕЙ: {len(recent_users)}\n\n"
+        
+        for user in recent_users:
+            user_id, username, first_name, last_name, created_at, alert_count = user
+            
+            user_info = f"👤 ID: {user_id}\n"
+            if username:
+                user_info += f"   @{username}\n"
+            if first_name:
+                user_info += f"   {first_name}"
+                if last_name:
+                    user_info += f" {last_name}"
+                user_info += "\n"
+            user_info += f"   📅 {created_at[:16]}\n"
+            user_info += f"   🔔 Алертов: {alert_count}\n"
+            user_info += "   ───────────────────\n"
+            
+            if len(response + user_info) > 4000:
+                bot.send_message(message.chat.id, response)
+                response = "🆕 ПРОДОЛЖЕНИЕ:\n\n" + user_info
+            else:
+                response += user_info
+        
+        bot.send_message(message.chat.id, response)
+        
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Количество дней должно быть числом!")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=['testprice'])
 def test_price(message):
