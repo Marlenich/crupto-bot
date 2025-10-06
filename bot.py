@@ -85,8 +85,12 @@ def get_current_price(symbol):
             full_symbol = f"{symbol.upper()}USDT"
         
         url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={full_symbol}"
+        print(f"🔍 Запрашиваю цену для: {full_symbol}")
         response = requests.get(url, timeout=10)
         data = response.json()
+        
+        # Отладочная информация
+        print(f"📊 Ответ API: {data}")
         
         # Проверяем структуру ответа
         if data.get('retCode') != 0:
@@ -104,8 +108,19 @@ def get_current_price(symbol):
             
         # Берем первый тикер из списка
         ticker = tickers[0]
-        current_price = float(ticker['lastPrice'])
         
+        # Пробуем разные поля с ценой
+        if 'lastPrice' in ticker and ticker['lastPrice']:
+            current_price = float(ticker['lastPrice'])
+        elif 'markPrice' in ticker and ticker['markPrice']:
+            current_price = float(ticker['markPrice'])
+        elif 'indexPrice' in ticker and ticker['indexPrice']:
+            current_price = float(ticker['indexPrice'])
+        else:
+            print(f"❌ Не найдено поле с ценой в ответе")
+            return None, symbol
+        
+        print(f"✅ Цена получена: {full_symbol} = ${current_price}")
         return current_price, full_symbol
         
     except Exception as e:
@@ -135,7 +150,28 @@ def send_welcome(message):
 @bot.message_handler(commands=['status'])
 def status(message):
     alerts_count = len(get_all_alerts())
-    bot.reply_to(message, f"✅ Бот работает!\nАктивных запросов: {alerts_count}\n\nИспользуй:\n/testalert - тестовый алерт\n/checknow - проверить сейчас\n/myalerts - мои алерты")
+    
+    # Проверяем текущую цену BTC для демонстрации
+    btc_price, _ = get_current_price("BTC")
+    price_info = f"\n💰 BTC сейчас: ${btc_price:,.2f}" if btc_price else ""
+    
+    bot.reply_to(message, f"✅ Бот работает!\nАктивных запросов: {alerts_count}{price_info}\n\nИспользуй:\n/testprice - проверить цену\n/checknow - мои алерты\n/myalerts - список алертов")
+
+@bot.message_handler(commands=['testprice'])
+def test_price(message):
+    """Проверка текущей цены"""
+    try:
+        symbol = "BTC"
+        current_price, full_symbol = get_current_price(symbol)
+        
+        if current_price:
+            response = f"🧪 ТЕКУЩАЯ ЦЕНА:\n\n{full_symbol}\n💰 ${current_price:,.2f}"
+            bot.reply_to(message, response)
+        else:
+            bot.reply_to(message, "❌ Не удалось получить цену BTC")
+            
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=['myalerts'])
 def list_alerts(message):
@@ -149,7 +185,7 @@ def list_alerts(message):
         for alert in alerts:
             id, symbol, target_price, alert_type = alert
             icon = "📈" if alert_type == "UP" else "📉"
-            response += f"• {icon} {symbol} -> ${target_price} ({alert_type})\n"
+            response += f"• {icon} {symbol} -> ${target_price:,.2f} ({alert_type})\n"
         bot.send_message(message.chat.id, response)
 
 @bot.message_handler(commands=['testalert'])
@@ -162,8 +198,8 @@ def test_alert(message):
         
         if current_price:
             # Создаем два тестовых алерта: один на рост, один на падение
-            test_target_up = current_price + 10  # На $10 выше
-            test_target_down = current_price - 10  # На $10 ниже
+            test_target_up = current_price + 100  # На $100 выше
+            test_target_down = current_price - 100  # На $100 ниже
             
             add_alert(user_id, full_symbol, test_target_up, current_price, "UP")
             add_alert(user_id, full_symbol, test_target_down, current_price, "DOWN")
@@ -198,13 +234,16 @@ def check_now(message):
             
         response = "🔍 Твои алерты:\n\n"
         for alert in user_alerts:
-            alert_id, user_id, symbol, target_price, current_price, alert_type = alert
+            alert_id, user_id, symbol, target_price, initial_price, alert_type = alert
             current_price_now, _ = get_current_price(symbol)
             
             if current_price_now:
                 icon = "📈" if alert_type == "UP" else "📉"
                 status = "✅ ГОТОВ!" if should_trigger_alert(current_price_now, target_price, alert_type) else "⏳ жду"
-                response += f"• {icon} {symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} - {status}\n"
+                diff = current_price_now - target_price
+                diff_text = f"+${diff:,.2f}" if diff > 0 else f"-${abs(diff):,.2f}"
+                
+                response += f"• {icon} {symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} ({diff_text}) - {status}\n"
             else:
                 response += f"• {symbol}: ошибка получения цены\n"
         
@@ -315,7 +354,7 @@ def check_prices():
             print(f"❌ Ошибка проверки: {e}")
         
         print(f"⏰ Жду 30 секунд...")
-        time.sleep(30)  # Вернули нормальный интервал
+        time.sleep(30)
 
 # Запуск
 if __name__ == "__main__":
