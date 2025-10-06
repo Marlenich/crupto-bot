@@ -145,7 +145,7 @@ def should_trigger_alert(current_price, target_price, alert_type):
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     print(f"👤 Пользователь {message.from_user.id} запустил бота")
-    bot.reply_to(message, "💰 Привет! Я бот для отслеживания цен крипты.\n\nПросто напиши: BTC 50000\n\nЯ сам пойму, ждать роста или падения цены! 📈📉")
+    bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипты.\n\nПросто напиши: BTC 50000\n\nЯ сам пойму, ждать роста или падения цены! 📈📉")
 
 @bot.message_handler(commands=['status'])
 def status(message):
@@ -155,7 +155,7 @@ def status(message):
     btc_price, _ = get_current_price("BTC")
     price_info = f"\n💰 BTC сейчас: ${btc_price:,.2f}" if btc_price else ""
     
-    bot.reply_to(message, f"✅ Бот работает!\nАктивных запросов: {alerts_count}{price_info}\n\nИспользуй:\n/testprice - проверить цену\n/checknow - мои алерты\n/myalerts - список алертов")
+    bot.send_message(message.chat.id, f"✅ Бот работает!\nАктивных запросов: {alerts_count}{price_info}\n\nИспользуй:\n/testprice - проверить цену\n/checknow - мои алерты\n/myalerts - список алертов")
 
 @bot.message_handler(commands=['testprice'])
 def test_price(message):
@@ -166,12 +166,12 @@ def test_price(message):
         
         if current_price:
             response = f"🧪 ТЕКУЩАЯ ЦЕНА:\n\n{full_symbol}\n💰 ${current_price:,.2f}"
-            bot.reply_to(message, response)
+            bot.send_message(message.chat.id, response)
         else:
-            bot.reply_to(message, "❌ Не удалось получить цену BTC")
+            bot.send_message(message.chat.id, "❌ Не удалось получить цену BTC")
             
     except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=['myalerts'])
 def list_alerts(message):
@@ -213,12 +213,12 @@ def test_alert(message):
 📉 Алерт на ПАДЕНИЕ: ${test_target_down:,.2f}
 
 Слежу за ценой!"""
-            bot.reply_to(message, response)
+            bot.send_message(message.chat.id, response)
         else:
-            bot.reply_to(message, "❌ Не удалось получить текущую цену BTC")
+            bot.send_message(message.chat.id, "❌ Не удалось получить текущую цену BTC")
             
     except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка: {e}")
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
 @bot.message_handler(commands=['checknow'])
 def check_now(message):
@@ -229,7 +229,7 @@ def check_now(message):
         user_alerts = [alert for alert in all_alerts if alert[1] == user_id]
         
         if not user_alerts:
-            bot.reply_to(message, "У тебя нет активных алертов")
+            bot.send_message(message.chat.id, "У тебя нет активных алертов")
             return
             
         response = "🔍 Твои алерты:\n\n"
@@ -247,10 +247,10 @@ def check_now(message):
             else:
                 response += f"• {symbol}: ошибка получения цены\n"
         
-        bot.reply_to(message, response)
+        bot.send_message(message.chat.id, response)
         
     except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка проверки: {e}")
+        bot.send_message(message.chat.id, f"❌ Ошибка проверки: {e}")
 
 @bot.message_handler(commands=['clear'])
 def clear_alerts(message):
@@ -261,7 +261,7 @@ def clear_alerts(message):
     count = cursor.rowcount
     conn.commit()
     conn.close()
-    bot.reply_to(message, f"✅ Удалено {count} алертов!")
+    bot.send_message(message.chat.id, f"✅ Удалено {count} алертов!")
 
 # Установка алерта
 @bot.message_handler(func=lambda message: True)
@@ -271,7 +271,7 @@ def set_alert(message):
         text = message.text.split()
         
         if len(text) < 2:
-            bot.reply_to(message, "❌ Напиши в формате: ТИКЕР ЦЕНА\nНапример: BTC 50000")
+            bot.send_message(message.chat.id, "❌ Напиши в формате: ТИКЕР ЦЕНА\nНапример: BTC 50000")
             return
 
         symbol = text[0].upper()
@@ -282,36 +282,30 @@ def set_alert(message):
         current_price, full_symbol = get_current_price(symbol)
         
         if current_price is None:
-            bot.reply_to(message, f"❌ Тикер '{symbol}' не найден. Попробуй: BTC, ETH, SOL, ADA")
+            bot.send_message(message.chat.id, f"❌ Тикер '{symbol}' не найден. Попробуй: BTC, ETH, SOL, ADA")
             return
 
         # Определяем тип алерта
         alert_type = determine_alert_type(current_price, target_price)
         alert_icon = "📈" if alert_type == "UP" else "📉"
-        alert_text = "роста" if alert_type == "UP" else "падения"
 
         add_alert(user_id, full_symbol, target_price, current_price, alert_type)
         
-        response = f"""✅ Алерт установлен!
-
-💠 Монета: {full_symbol}
+        response = f"""{full_symbol}
 💰 Текущая цена: ${current_price:,.2f}
-{alert_icon} Оповещение при: ${target_price:,.2f}
-🎯 Тип: жду {alert_text} цены
+{alert_icon} Оповещение при: <b>${target_price:,.2f}</b>"""
 
-Бот следит за ценой каждые 30 секунд!"""
-        
-        bot.reply_to(message, response)
+        bot.send_message(message.chat.id, response, parse_mode='HTML')
         
     except ValueError:
-        bot.reply_to(message, "❌ Цена должна быть числом!\nПример: BTC 50000 или ETH 3500.50")
+        bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или ETH 3500.50")
     except Exception as e:
-        bot.reply_to(message, "❌ Ошибка, попробуй еще раз")
+        bot.send_message(message.chat.id, "❌ Ошибка, попробуй еще раз")
         print(f"❌ Ошибка: {e}")
 
 # Фоновая проверка цен
 def check_prices():
-    print("🔄 Фоновая проверка цен ЗАПУЩЕНА! (интервал: 30 секунд)")
+    print("🔄 Фоновая проверка цен ЗАПУЩЕНА! (интервал: 5 секунд)")
     while True:
         try:
             all_alerts = get_all_alerts()
@@ -331,15 +325,8 @@ def check_prices():
                         print(f"🚨 АЛЕРТ СРАБОТАЛ! {symbol} {alert_type} ${target_price}")
                         try:
                             icon = "📈" if alert_type == "UP" else "📉"
-                            direction = "выросла" if alert_type == "UP" else "упала"
-                            message_text = f"""🚀 АЛЕРТ! 🚀
-
-{icon} {symbol} {direction} до цели!
-
-🎯 Цель: ${target_price:,.2f}
-💰 Текущая цена: ${current_price:,.2f}
-
-Алерт выполнен! ✅"""
+                            direction = "выросла до" if alert_type == "UP" else "упала до"
+                            message_text = f"{icon} {symbol} {direction} ${target_price:,.2f}"
                             bot.send_message(user_id, message_text)
                             delete_alert(alert_id)
                             print(f"✅ Уведомление отправлено пользователю {user_id}")
@@ -353,8 +340,8 @@ def check_prices():
         except Exception as e:
             print(f"❌ Ошибка проверки: {e}")
         
-        print(f"⏰ Жду 30 секунд...")
-        time.sleep(30)
+        print(f"⏰ Жду 5 секунд...")
+        time.sleep(5)
 
 # Запуск
 if __name__ == "__main__":
