@@ -75,12 +75,41 @@ def get_user_alerts(user_id):
 
 def get_current_price(symbol):
     try:
-        full_symbol = f"{symbol.upper()}USDT"
+        # Убираем USDT если уже есть в символе
+        if symbol.endswith('USDT'):
+            full_symbol = symbol
+        else:
+            full_symbol = f"{symbol.upper()}USDT"
+        
         url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={full_symbol}"
+        print(f"🔍 Запрашиваю цену для: {full_symbol}")
         response = requests.get(url, timeout=10)
         data = response.json()
-        current_price = float(data['result']['list'][0]['lastPrice'])
+        
+        # Отладочная информация
+        print(f"📊 Ответ API: {data}")
+        
+        # Проверяем структуру ответа
+        if data.get('retCode') != 0:
+            print(f"❌ Ошибка API: {data.get('retMsg')}")
+            return None, symbol
+            
+        if 'result' not in data or 'list' not in data['result']:
+            print(f"❌ Неверная структура ответа API")
+            return None, symbol
+            
+        tickers = data['result']['list']
+        if not tickers:
+            print(f"❌ Нет данных для символа {full_symbol}")
+            return None, symbol
+            
+        # Берем первый тикер из списка
+        ticker = tickers[0]
+        current_price = float(ticker['lastPrice'])
+        
+        print(f"✅ Цена получена: {full_symbol} = ${current_price}")
         return current_price, full_symbol
+        
     except Exception as e:
         print(f"❌ Ошибка получения цены для {symbol}: {e}")
         return None, symbol
@@ -224,6 +253,8 @@ def check_prices():
             
             for alert in all_alerts:
                 alert_id, user_id, symbol, target_price = alert
+                print(f"🔍 Проверяю алерт {alert_id}: {symbol} -> ${target_price}")
+                
                 current_price, _ = get_current_price(symbol)
 
                 if current_price:
