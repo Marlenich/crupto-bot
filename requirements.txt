@@ -1,2 +1,3 @@
-pytelegrambotapi
+pyTelegramBotAPI
 requests
+psycopg2-binary

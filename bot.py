@@ -1,8 +1,8 @@
 import telebot
-import sqlite3
+import psycopg2
+import os
 import requests
 import time
-import os
 import threading
 
 print("=== БОТ ЗАПУЩЕН НА RAILWAY ===")
@@ -10,14 +10,22 @@ print("=== БОТ ЗАПУЩЕН НА RAILWAY ===")
 # Токен бота
 TELEGRAM_BOT_TOKEN = '7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU'
 
-# ID администратора (ЗАМЕНИ НА СВОЙ ID)
-ADMIN_ID = 5870642170  # ЗАМЕНИ НА СВОЙ TELEGRAM ID
+# ID администратора
+ADMIN_ID = 5870642170
+
+# PostgreSQL connection string from Railway environment variable
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 if not TELEGRAM_BOT_TOKEN:
     print("❌ ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
     exit()
 
+if not DATABASE_URL:
+    print("❌ ОШИБКА: DATABASE_URL не найден! Нужно добавить PostgreSQL в Railway")
+    exit()
+
 print(f"✅ Токен получен! Длина: {len(TELEGRAM_BOT_TOKEN)} символов")
+print(f"✅ Database URL получен")
 
 # Создаем бота
 try:
@@ -32,15 +40,18 @@ available_symbols_cache = None
 cache_timestamp = 0
 CACHE_DURATION = 3600  # 1 час
 
-# База данных
+# Функции для работы с базой данных
+def get_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
+
 def init_db():
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
     
     # Таблица пользователей
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
+        user_id BIGINT PRIMARY KEY,
         username TEXT,
         first_name TEXT,
         last_name TEXT,
@@ -52,58 +63,69 @@ def init_db():
     # Таблица алертов
     cursor.execute('''
     CREATE TABLE IF NOT EXISTS alerts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL,
         symbol TEXT NOT NULL,
-        target_price REAL NOT NULL,
-        current_price REAL NOT NULL,
+        target_price DECIMAL(20,8) NOT NULL,
+        current_price DECIMAL(20,8) NOT NULL,
         alert_type TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(user_id)
     )
     ''')
     
     conn.commit()
+    cursor.close()
     conn.close()
     print("✅ База данных готова")
 
 def add_alert(user_id, symbol, target_price, current_price, alert_type):
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
     
     # Обновляем активность пользователя
     cursor.execute('''
-    INSERT OR REPLACE INTO users (user_id, last_activity) 
-    VALUES (?, CURRENT_TIMESTAMP)
+    INSERT INTO users (user_id, last_activity) 
+    VALUES (%s, CURRENT_TIMESTAMP)
+    ON CONFLICT (user_id) 
+    DO UPDATE SET last_activity = CURRENT_TIMESTAMP
     ''', (user_id,))
     
     # Добавляем алерт
-    cursor.execute('INSERT INTO alerts (user_id, symbol, target_price, current_price, alert_type) VALUES (?, ?, ?, ?, ?)',
-                   (user_id, symbol.upper(), target_price, current_price, alert_type))
+    cursor.execute('''
+    INSERT INTO alerts (user_id, symbol, target_price, current_price, alert_type) 
+    VALUES (%s, %s, %s, %s, %s)
+    ''', (user_id, symbol.upper(), target_price, current_price, alert_type))
+    
     conn.commit()
+    cursor.close()
     conn.close()
-    print(f"✅ Добавлен алерт: {symbol} {alert_type} ${target_price:.6f} (сейчас: ${current_price:.6f})")
+    print(f"✅ Добавлен алерт: {symbol} {alert_type} ${float(target_price):.6f}")
 
 def get_all_alerts():
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('SELECT id, user_id, symbol, target_price, current_price, alert_type FROM alerts')
     all_alerts = cursor.fetchall()
+    cursor.close()
     conn.close()
     return all_alerts
 
 def delete_alert(alert_id):
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM alerts WHERE id = ?', (alert_id,))
+    cursor.execute('DELETE FROM alerts WHERE id = %s', (alert_id,))
     conn.commit()
+    cursor.close()
     conn.close()
     print(f"✅ Удален алерт ID: {alert_id}")
 
 def get_user_alerts(user_id):
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, symbol, target_price, alert_type FROM alerts WHERE user_id = ?', (user_id,))
+    cursor.execute('SELECT id, symbol, target_price, alert_type FROM alerts WHERE user_id = %s', (user_id,))
     alerts = cursor.fetchall()
+    cursor.close()
     conn.close()
     return alerts
 
@@ -230,7 +252,7 @@ def is_admin(user_id):
 
 def format_price(price):
     """Форматирует цену с 6 знаками после запятой"""
-    return f"{price:.6f}".rstrip('0').rstrip('.') if '.' in f"{price:.6f}" else f"{price:.6f}"
+    return f"{float(price):.6f}".rstrip('0').rstrip('.') if '.' in f"{float(price):.6f}" else f"{float(price):.6f}"
 
 # Команды бота
 @bot.message_handler(commands=['start'])
@@ -241,13 +263,20 @@ def send_welcome(message):
     last_name = message.from_user.last_name
     
     # Логируем пользователя (в фоне, пользователь не видит)
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute('''
-    INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, created_at, last_activity) 
-    VALUES (?, ?, ?, ?, COALESCE((SELECT created_at FROM users WHERE user_id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
-    ''', (user_id, username, first_name, last_name, user_id))
+    INSERT INTO users (user_id, username, first_name, last_name, last_activity) 
+    VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+    ON CONFLICT (user_id) 
+    DO UPDATE SET 
+        username = EXCLUDED.username,
+        first_name = EXCLUDED.first_name,
+        last_name = EXCLUDED.last_name,
+        last_activity = CURRENT_TIMESTAMP
+    ''', (user_id, username, first_name, last_name))
     conn.commit()
+    cursor.close()
     conn.close()
     
     print(f"👤 Пользователь {user_id} запустил бота")
@@ -331,7 +360,7 @@ def show_stats(message):
         bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
         return
         
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
     
     # Количество уникальных пользователей
@@ -343,9 +372,10 @@ def show_stats(message):
     total_alerts = cursor.fetchone()[0]
     
     # Активные пользователи (за последние 7 дней)
-    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM alerts WHERE created_at > datetime("now", "-7 days")')
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM alerts WHERE created_at > CURRENT_TIMESTAMP - INTERVAL \'7 days\'')
     active_users = cursor.fetchone()[0]
     
+    cursor.close()
     conn.close()
     
     stats_text = f"""📊 СТАТИСТИКА БОТА:
@@ -363,7 +393,7 @@ def detailed_stats(message):
         bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
         return
         
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
     
     # Основная статистика
@@ -374,19 +404,20 @@ def detailed_stats(message):
     total_alerts = cursor.fetchone()[0]
     
     # Активные пользователи за разные периоды
-    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-1 day")')
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > CURRENT_TIMESTAMP - INTERVAL \'1 day\'')
     active_1d = cursor.fetchone()[0]
     
-    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-7 days")')
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > CURRENT_TIMESTAMP - INTERVAL \'7 days\'')
     active_7d = cursor.fetchone()[0]
     
-    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-30 days")')
+    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > CURRENT_TIMESTAMP - INTERVAL \'30 days\'')
     active_30d = cursor.fetchone()[0]
     
     # Популярные монеты
     cursor.execute('SELECT symbol, COUNT(*) as count FROM alerts GROUP BY symbol ORDER BY count DESC LIMIT 5')
     popular_coins = cursor.fetchall()
     
+    cursor.close()
     conn.close()
     
     stats_text = f"""📊 ДЕТАЛЬНАЯ СТАТИСТИКА:
@@ -414,7 +445,7 @@ def user_list(message):
         bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
         return
         
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
     
     # Получаем всех пользователей с количеством их алертов
@@ -423,11 +454,12 @@ def user_list(message):
            COUNT(a.id) as alert_count
     FROM users u 
     LEFT JOIN alerts a ON u.user_id = a.user_id 
-    GROUP BY u.user_id 
+    GROUP BY u.user_id, u.username, u.first_name, u.last_name, u.created_at, u.last_activity
     ORDER BY u.created_at DESC
     ''')
     users = cursor.fetchall()
     
+    cursor.close()
     conn.close()
     
     if not users:
@@ -442,8 +474,8 @@ def user_list(message):
         user_id, username, first_name, last_name, created_at, last_activity, alert_count = user
         
         # Форматируем даты
-        created = created_at[:16] if created_at else "неизвестно"
-        last_active = last_activity[:16] if last_activity else "неизвестно"
+        created = created_at.strftime('%Y-%m-%d %H:%M') if created_at else "неизвестно"
+        last_active = last_activity.strftime('%Y-%m-%d %H:%M') if last_activity else "неизвестно"
         
         user_info = f"#{i} 👤 ID: {user_id}\n"
         if username:
@@ -483,22 +515,24 @@ def user_info(message):
             
         target_user_id = int(parts[1])
         
-        conn = sqlite3.connect('alerts.db', check_same_thread=False)
+        conn = get_connection()
         cursor = conn.cursor()
         
         # Информация о пользователе
-        cursor.execute('SELECT * FROM users WHERE user_id = ?', (target_user_id,))
+        cursor.execute('SELECT * FROM users WHERE user_id = %s', (target_user_id,))
         user_data = cursor.fetchone()
         
         if not user_data:
             bot.send_message(message.chat.id, f"❌ Пользователь с ID {target_user_id} не найден")
+            cursor.close()
             conn.close()
             return
         
         # Алерты пользователя
-        cursor.execute('SELECT symbol, target_price, alert_type, created_at FROM alerts WHERE user_id = ? ORDER BY created_at DESC', (target_user_id,))
+        cursor.execute('SELECT symbol, target_price, alert_type, created_at FROM alerts WHERE user_id = %s ORDER BY created_at DESC', (target_user_id,))
         user_alerts = cursor.fetchall()
         
+        cursor.close()
         conn.close()
         
         user_id, username, first_name, last_name, created_at, last_activity = user_data
@@ -517,7 +551,7 @@ def user_info(message):
             for i, alert in enumerate(user_alerts[:10], 1):  # Показываем последние 10
                 symbol, target_price, alert_type, created_at = alert
                 icon = "📈" if alert_type == "UP" else "📉"
-                response += f"{i}. {icon} {symbol} -> ${format_price(target_price)} ({created_at[:16]})\n"
+                response += f"{i}. {icon} {symbol} -> ${format_price(target_price)} ({created_at.strftime('%Y-%m-%d %H:%M')})\n"
             if len(user_alerts) > 10:
                 response += f"\n... и еще {len(user_alerts) - 10} алертов"
         else:
@@ -544,18 +578,19 @@ def recent_users(message):
         if len(parts) >= 2:
             days = int(parts[1])
         
-        conn = sqlite3.connect('alerts.db', check_same_thread=False)
+        conn = get_connection()
         cursor = conn.cursor()
         
         cursor.execute('''
         SELECT user_id, username, first_name, last_name, created_at, 
                (SELECT COUNT(*) FROM alerts WHERE user_id = users.user_id) as alert_count
         FROM users 
-        WHERE created_at > datetime("now", "-? days") 
+        WHERE created_at > CURRENT_TIMESTAMP - INTERVAL '%s days' 
         ORDER BY created_at DESC
         ''', (days,))
         
         recent_users = cursor.fetchall()
+        cursor.close()
         conn.close()
         
         if not recent_users:
@@ -575,7 +610,7 @@ def recent_users(message):
                 if last_name:
                     user_info += f" {last_name}"
                 user_info += "\n"
-            user_info += f"   📅 {created_at[:16]}\n"
+            user_info += f"   📅 {created_at.strftime('%Y-%m-%d %H:%M')}\n"
             user_info += f"   🔔 Алертов: {alert_count}\n"
             user_info += "   ───────────────────\n"
             
@@ -643,8 +678,8 @@ def check_now(message):
             if current_price_now:
                 icon = "📈" if alert_type == "UP" else "📉"
                 status = "✅ ГОТОВ!" if should_trigger_alert(current_price_now, target_price, alert_type) else "⏳ жду"
-                diff = current_price_now - target_price
-                diff_percent = (diff / target_price) * 100
+                diff = current_price_now - float(target_price)
+                diff_percent = (diff / float(target_price)) * 100
                 
                 response += f"• {icon} {symbol}: ${format_price(current_price_now)} / ${format_price(target_price)} ({diff_percent:+.2f}%) - {status}\n"
             else:
@@ -658,11 +693,12 @@ def check_now(message):
 @bot.message_handler(commands=['clear'])
 def clear_alerts(message):
     user_id = message.from_user.id
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
+    conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute('DELETE FROM alerts WHERE user_id = ?', (user_id,))
+    cursor.execute('DELETE FROM alerts WHERE user_id = %s', (user_id,))
     count = cursor.rowcount
     conn.commit()
+    cursor.close()
     conn.close()
     bot.send_message(message.chat.id, f"✅ Удалено {count} алертов!")
 
@@ -745,7 +781,7 @@ def check_prices():
                 if current_price:
                     print(f"💰 {symbol}: ${format_price(current_price)} / ${format_price(target_price)} ({alert_type})")
                     
-                    if should_trigger_alert(current_price, target_price, alert_type):
+                    if should_trigger_alert(current_price, float(target_price), alert_type):
                         print(f"🚨 АЛЕРТ СРАБОТАЛ! {symbol} {alert_type} ${format_price(target_price)}")
                         try:
                             icon = "📈" if alert_type == "UP" else "📉"
