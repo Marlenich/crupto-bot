@@ -507,7 +507,7 @@ def check_prices():
                     if should_trigger_alert(current_price, target_price, alert_type):
                         print(f"🚨 АЛЕРТ СРАБОТАЛ! {symbol} {alert_type} ${format_price(target_price)}")
                         try:
-                            icon = "📈" если alert_type == "UP" else "📉"
+                            icon = "📈" if alert_type == "UP" else "📉"
                             direction = "выросла до" if alert_type == "UP" else "упала до"
                             message_text = f"{icon} {symbol} {direction} ${format_price(target_price)}"
                             bot.send_message(user_id, message_text)
