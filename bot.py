@@ -3,16 +3,13 @@ import sqlite3
 import requests
 import time
 import os
+import sys
 import threading
-import logging
+import signal
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
 print("=== БОТ ЗАПУЩЕН НА RAILWAY ===")
-
-# Настройка логирования
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # Токен бота
 TELEGRAM_BOT_TOKEN = '7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU'
@@ -25,6 +22,9 @@ if not TELEGRAM_BOT_TOKEN:
     exit()
 
 print(f"✅ Токен получен! Длина: {len(TELEGRAM_BOT_TOKEN)} символов")
+
+# Флаг для остановки потоков
+stop_threads = False
 
 # Создаем сессию requests с повторными попытками
 session = requests.Session()
@@ -100,7 +100,6 @@ def add_alert(user_id, symbol, target_price, current_price, alert_type):
                    (user_id, symbol.upper(), target_price, current_price, alert_type))
     conn.commit()
     conn.close()
-    print(f"✅ Добавлен алерт: {symbol} {alert_type} ${target_price}")
 
 def get_active_alerts():
     """Получаем только не сработавшие алерты"""
@@ -151,7 +150,7 @@ def get_current_price(symbol):
             full_symbol = f"{symbol.upper()}USDT"
         
         url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={full_symbol}"
-        response = session.get(url, timeout=3)  # Уменьшен таймаут
+        response = session.get(url, timeout=3)
         data = response.json()
         
         # Проверяем структуру ответа
@@ -219,7 +218,6 @@ def send_welcome(message):
     conn.commit()
     conn.close()
     
-    print(f"👤 Пользователь {user_id} запустил бота")
     bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипто монет на Bybit.\n\nПросто напиши: BTC 50000 (пример)\n\nЯ пришлю уведомление когда цена достигнет указанных значений")
 
 @bot.message_handler(commands=['status'])
@@ -485,21 +483,18 @@ def set_alert(message):
 
 # Фоновая проверка цен
 def check_prices():
-    print("🔄 Фоновая проверка цен ЗАПУЩЕНА! (интервал: 10 секунд)")
+    print("🔄 Фоновая проверка цен ЗАПУЩЕНА!")
     
     # Словарь для кэширования цен
     price_cache = {}
     cache_time = {}
     CACHE_DURATION = 5  # секунды
     
-    while True:
+    while not stop_threads:
         try:
             alerts = get_active_alerts()
             
             if alerts:
-                # Логируем только если есть алерты
-                print(f"🔍 Проверяю {len(alerts)} активных алертов...")
-                
                 # Группируем алерты по символам
                 alerts_by_symbol = {}
                 symbols_to_check = set()
@@ -534,7 +529,6 @@ def check_prices():
                             del cache_time[symbol]
                 
                 # Проверяем алерты
-                triggered_count = 0
                 for symbol, symbol_alerts in alerts_by_symbol.items():
                     if symbol not in current_prices:
                         continue
@@ -551,7 +545,6 @@ def check_prices():
                                 message_text = f"{icon} {symbol} {direction} ${target_price:,.2f}"
                                 bot.send_message(user_id, message_text)
                                 mark_alert_triggered(alert_id)
-                                triggered_count += 1
                                 
                                 # Удаляем из кэша
                                 if symbol in price_cache:
@@ -559,22 +552,30 @@ def check_prices():
                                 if symbol in cache_time:
                                     del cache_time[symbol]
                                     
-                            except Exception as e:
-                                # Просто игнорируем ошибки отправки
+                            except Exception:
+                                # Игнорируем ошибки отправки
                                 pass
-                
-                if triggered_count > 0:
-                    print(f"✅ Сработало {triggered_count} алертов")
             
-            # Ждем 10 секунд между проверками
-            time.sleep(10)
+            # Ждем 5 секунд между проверками
+            time.sleep(5)
                         
-        except Exception as e:
-            print(f"❌ Ошибка проверки: {e}")
-            time.sleep(10)
+        except Exception:
+            time.sleep(5)
+
+def signal_handler(signum, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    global stop_threads
+    print("\n🛑 Получен сигнал остановки...")
+    stop_threads = True
+    time.sleep(1)
+    sys.exit(0)
 
 # Запуск
 if __name__ == "__main__":
+    # Регистрируем обработчик сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     print("🔄 Инициализация...")
     init_db()
     
@@ -586,9 +587,22 @@ if __name__ == "__main__":
     print("✅ ВСЕ СИСТЕМЫ ЗАПУЩЕНЫ")
     print("🤖 Бот начинает опрос Telegram...")
     
-    try:
-        bot.polling(none_stop=True, interval=1, timeout=30)
-    except Exception as e:
-        print(f"❌ Ошибка бота: {e}")
-        time.sleep(5)
-        os.execv(sys.executable, [sys.executable] + sys.argv)
+    # Главный цикл работы бота с перезапуском при ошибках
+    while not stop_threads:
+        try:
+            print("🔄 Запуск polling...")
+            bot.polling(none_stop=False, interval=1, timeout=30)
+        except telebot.apihelper.ApiTelegramException as e:
+            if "terminated by other getUpdates request" in str(e):
+                print("⚠️ Обнаружено несколько экземпляров бота. Жду 10 секунд...")
+                time.sleep(10)
+            else:
+                print(f"❌ Ошибка Telegram API: {e}")
+                time.sleep(5)
+        except Exception as e:
+            print(f"❌ Общая ошибка: {e}")
+            time.sleep(5)
+        finally:
+            if not stop_threads:
+                print("🔄 Перезапуск бота через 5 секунд...")
+                time.sleep(5)
