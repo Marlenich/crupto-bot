@@ -7,6 +7,8 @@ import sys
 import threading
 import signal
 import atexit
+import socket
+import fcntl
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
@@ -18,11 +20,44 @@ TELEGRAM_BOT_TOKEN = '7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU'
 # ID администратора (ЗАМЕНИ НА СВОЙ ID)
 ADMIN_ID = 123456789  # ЗАМЕНИ НА СВОЙ TELEGRAM ID
 
+# Файл блокировки для предотвращения запуска нескольких экземпляров
+LOCK_FILE = '/tmp/bot.lock'
+
+def acquire_lock():
+    """Приобретает блокировку файла"""
+    try:
+        lock_fd = open(LOCK_FILE, 'w')
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_fd
+    except (IOError, BlockingIOError):
+        print("❌ Другой экземпляр бота уже запущен. Завершаюсь...")
+        return None
+
+def release_lock(lock_fd):
+    """Освобождает блокировку файла"""
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+        os.remove(LOCK_FILE)
+    except:
+        pass
+
+# Пытаемся получить блокировку
+lock_fd = acquire_lock()
+if not lock_fd:
+    print("❌ Не удалось получить блокировку. Возможно, бот уже запущен.")
+    sys.exit(1)
+
+# Регистрируем освобождение блокировки при выходе
+atexit.register(release_lock, lock_fd)
+
 if not TELEGRAM_BOT_TOKEN:
     print("❌ ОШИБКА: TELEGRAM_BOT_TOKEN не найден!")
+    release_lock(lock_fd)
     exit()
 
 print(f"✅ Токен получен! Длина: {len(TELEGRAM_BOT_TOKEN)} символов")
+print(f"✅ Блокировка получена. PID: {os.getpid()}")
 
 # Глобальные флаги и переменные
 bot_instance = None
@@ -234,11 +269,6 @@ def get_current_price(symbol):
         print(f"❌ Ошибка получения цены для {symbol}: {str(e)[:200]}")
         return None, symbol
 
-def check_symbol_exists(symbol):
-    """Проверяет, существует ли символ на Bybit"""
-    price, found_symbol = get_current_price(symbol)
-    return price is not None, found_symbol
-
 def determine_alert_type(current_price, target_price):
     """Определяем тип алерта: UP (рост) или DOWN (падение)"""
     if target_price > current_price:
@@ -319,30 +349,6 @@ def setup_bot_handlers(bot):
         
         bot.send_message(message.chat.id, help_text)
     
-    @bot.message_handler(commands=['search'])
-    def search_coin(message):
-        """Поиск монеты на Bybit"""
-        try:
-            parts = message.text.split()
-            if len(parts) < 2:
-                bot.send_message(message.chat.id, "❌ Используй: /search ТИКЕР\nПример: /search MYX")
-                return
-            
-            symbol = parts[1].upper()
-            exists, found_symbol = check_symbol_exists(symbol)
-            
-            if exists:
-                price, _ = get_current_price(symbol)
-                if price:
-                    bot.send_message(message.chat.id, f"✅ Монета найдена!\n\n📈 Символ: {found_symbol}\n💰 Цена: ${price:,.8f}\n\nТеперь можешь установить алерт:\n{symbol} {price * 1.1:.8f}")
-                else:
-                    bot.send_message(message.chat.id, f"✅ Монета найдена: {found_symbol}\n\nНо не удалось получить текущую цену.")
-            else:
-                bot.send_message(message.chat.id, f"❌ Монета '{symbol}' не найдена на Bybit.\n\nПопробуй:\n• Проверить правильность написания\n• Убедиться, что монета торгуется на Bybit\n• Попробовать другой тикер")
-                
-        except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Ошибка поиска: {str(e)[:100]}")
-    
     @bot.message_handler(commands=['status'])
     def status(message):
         active_alerts = get_active_alerts()
@@ -370,121 +376,48 @@ def setup_bot_handlers(bot):
         
         bot.send_message(message.chat.id, status_text)
     
-    @bot.message_handler(commands=['test'])
-    def test_bot(message):
-        """Тестовая команда для проверки работы бота"""
+    @bot.message_handler(commands=['search'])
+    def search_coin(message):
+        """Поиск монеты на Bybit"""
         try:
-            # Проверяем несколько популярных монет
-            test_results = []
+            parts = message.text.split()
+            if len(parts) < 2:
+                bot.send_message(message.chat.id, "❌ Используй: /search ТИКЕР\nПример: /search MYX")
+                return
             
-            for symbol in ["BTC", "ETH", "SOL", "ADA"]:
-                price, found_symbol = get_current_price(symbol)
-                if price:
-                    test_results.append(f"✅ {found_symbol}: ${price:,.2f}")
-                else:
-                    test_results.append(f"❌ {symbol}: не найдено")
+            symbol = parts[1].upper()
+            price, found_symbol = get_current_price(symbol)
             
-            test_text = f"""🧪 ТЕСТ БОТА:
-
-{chr(10).join(test_results)}
-
-📊 Результат: {len([r for r in test_results if '✅' in r])}/4 монет найдено
-
-🚀 Бот готов к работе!"""
-            
-            bot.send_message(message.chat.id, test_text)
-            
-        except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Ошибка теста: {str(e)[:100]}")
-    
-    @bot.message_handler(commands=['testalert'])
-    def test_alert_command(message):
-        """Создание тестового алерта"""
-        user_id = message.from_user.id
-        try:
-            symbol = "BTC"
-            current_price, full_symbol = get_current_price(symbol)
-            
-            if current_price:
-                # Создаем тестовый алерт на $1 выше текущей цены
-                test_target = current_price + 1
-                
-                alert_type = determine_alert_type(current_price, test_target)
-                alert_icon = "📈" if alert_type == "UP" else "📉"
-                
-                add_alert(user_id, full_symbol, test_target, current_price, alert_type)
-                
-                test_text = f"""🧪 ТЕСТОВЫЙ АЛЕРТ СОЗДАН!
-
-{full_symbol}
-💰 Текущая цена: ${current_price:,.2f}
-{alert_icon} Оповещение при: <b>${test_target:,.2f}</b>
-
-Алерт будет проверяться каждые 5 секунд.
-Цена должна немного вырасти для срабатывания."""
-                
-                bot.send_message(message.chat.id, test_text, parse_mode='HTML')
+            if price:
+                bot.send_message(message.chat.id, f"✅ Монета найдена!\n\n📈 Символ: {found_symbol}\n💰 Цена: ${price:,.8f}\n\nТеперь можешь установить алерт:\n{symbol} {price * 1.1:.8f}")
             else:
-                bot.send_message(message.chat.id, "❌ Не удалось получить текущую цену BTC")
+                bot.send_message(message.chat.id, f"❌ Монета '{symbol}' не найдена на Bybit.\n\nПопробуй:\n• Проверить правильность написания\n• Убедиться, что монета торгуется на Bybit\n• Попробовать другой тикер")
                 
         except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)[:100]}")
-    
-    @bot.message_handler(commands=['stats'])
-    def show_stats(message):
-        """Статистика (только для администратора)"""
-        if not is_admin(message.from_user.id):
-            bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
-            return
-            
-        conn = sqlite3.connect('alerts.db', check_same_thread=False)
-        cursor = conn.cursor()
-        
-        # Количество уникальных пользователей
-        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM alerts')
-        unique_users = cursor.fetchone()[0]
-        
-        # Общее количество алертов
-        cursor.execute('SELECT COUNT(*) FROM alerts')
-        total_alerts = cursor.fetchone()[0]
-        
-        # Активные алерты
-        cursor.execute('SELECT COUNT(*) FROM alerts WHERE triggered = 0')
-        active_alerts = cursor.fetchone()[0]
-        
-        conn.close()
-        
-        stats_text = f"""📊 СТАТИСТИКА БОТА:
-
-👥 Всего пользователей: {unique_users}
-🔔 Всего алертов: {total_alerts}
-🎯 Активных алертов: {active_alerts}"""
-
-        bot.send_message(message.chat.id, stats_text)
+            bot.send_message(message.chat.id, f"❌ Ошибка поиска: {str(e)[:100]}")
     
     @bot.message_handler(commands=['testprice'])
     def test_price(message):
         """Проверка текущей цены"""
         try:
-            # Получаем цены нескольких популярных монет
-            symbols_to_check = ["BTC", "ETH", "SOL", "BNB"]
-            results = []
+            symbol = "BTC"
+            current_price, full_symbol = get_current_price(symbol)
             
-            for symbol in symbols_to_check:
-                current_price, full_symbol = get_current_price(symbol)
-                if current_price:
-                    results.append(f"{full_symbol}: ${current_price:,.2f}")
-                else:
-                    results.append(f"{symbol}: не найдено")
-            
-            response = f"""🧪 ТЕКУЩИЕ ЦЕНЫ:
+            if current_price:
+                # Также проверяем ETH для демонстрации
+                eth_price, eth_symbol = get_current_price("ETH")
+                
+                response = f"""🧪 ТЕКУЩИЕ ЦЕНЫ:
 
-{chr(10).join(results)}
-
-💡 Попробуй: /search ТИКЕР
-Пример: /search MYX"""
-            
-            bot.send_message(message.chat.id, response)
+{full_symbol}
+💰 ${current_price:,.2f}"""
+                
+                if eth_price:
+                    response += f"\n\n{eth_symbol}\n💰 ${eth_price:,.2f}"
+                
+                bot.send_message(message.chat.id, response)
+            else:
+                bot.send_message(message.chat.id, "❌ Не удалось получить цену BTC")
                 
         except Exception as e:
             bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)[:100]}")
@@ -495,13 +428,13 @@ def setup_bot_handlers(bot):
         alerts = get_user_alerts(user_id)
         
         if not alerts:
-            bot.send_message(message.chat.id, "📭 У тебя нет активных алертов.\n\nСоздай алерт командой:\nBTC 50000\nИли любой другой тикер с ценой")
+            bot.send_message(message.chat.id, "📭 У тебя нет активных алертов.\n\nСоздай алерт командой:\nBTC 50000")
         else:
             response = "📋 ТВОИ АКТИВНЫЕ АЛЕРТЫ:\n\n"
             for alert in alerts:
                 id, symbol, target_price, alert_type = alert
                 icon = "📈" if alert_type == "UP" else "📉"
-                response += f"• {icon} {symbol} -> ${target_price:,.8f}\n"
+                response += f"• {icon} {symbol} -> ${target_price:,.2f}\n"
             bot.send_message(message.chat.id, response)
     
     @bot.message_handler(commands=['checknow'])
@@ -535,16 +468,12 @@ def setup_bot_handlers(bot):
                     diff_percent = (diff / target_price) * 100
                     diff_text = f"+{diff_percent:.2f}%" if diff > 0 else f"{diff_percent:.2f}%"
                     
-                    # Форматируем цену в зависимости от размера
-                    price_format = "${:,.8f}" if current_price_now < 0.01 else "${:,.2f}"
-                    target_format = "${:,.8f}" if target_price < 0.01 else "${:,.2f}"
-                    
-                    response += f"• {icon} {full_symbol}: {price_format.format(current_price_now)} / {target_format.format(target_price)} ({diff_text}) - {status}\n"
+                    response += f"• {icon} {full_symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} ({diff_text}) - {status}\n"
                 else:
                     response += f"• {symbol}: ❌ ошибка получения цены\n"
             
             if triggered_count > 0:
-                response += f"\n🎯 Готово к отправке: {triggered_count} алертов"
+                response += f"\n🎯 Готово к отправку: {triggered_count} алертов"
             
             bot.send_message(message.chat.id, response)
             
@@ -581,7 +510,7 @@ def setup_bot_handlers(bot):
                 bot.send_message(message.chat.id, "❌ Напиши в формате: ТИКЕР ЦЕНА\nНапример: BTC 50000 или MYX 0.1")
                 return
 
-            symbol = text[0].upper().replace('$', '').replace(',', '').replace('/', '')
+            symbol = text[0].upper().replace('$', '').replace(',', '')
             try:
                 target_price = float(text[1].replace('$', '').replace(',', ''))
             except ValueError:
@@ -764,6 +693,9 @@ def stop_bot():
     global session
     session.close()
     
+    # Освобождаем блокировку
+    release_lock(lock_fd)
+    
     print("✅ Бот остановлен")
 
 def signal_handler(signum, frame):
@@ -819,26 +751,28 @@ def run_bot():
             
             # Запускаем polling с коротким таймаутом
             polling_active = True
-            bot_instance.polling(none_stop=True, interval=1, timeout=20, long_polling_timeout=20)
+            
+            # Используем только один long polling запрос
+            bot_instance.polling(
+                none_stop=True,
+                interval=0,  # Немедленно после получения обновлений
+                timeout=30,  # Таймаут для long polling
+                long_polling_timeout=30,
+                allowed_updates=None,
+                restart_on_change=False
+            )
             
         except telebot.apihelper.ApiTelegramException as e:
             polling_active = False
             
             if "Conflict: terminated by other getUpdates request" in str(e):
-                print("⚠️ Ошибка 409: Обнаружен другой запущенный экземпляр бота")
-                print("🔄 Жду 30 секунд и создаю нового бота...")
+                print("⚠️ Критическая ошибка 409: Обнаружен другой запущенный экземпляр бота")
+                print("🛑 Завершаю работу, так как у нас есть файловая блокировка")
+                print("ℹ️ Это может означать, что на Railway запущено несколько реплик")
                 
-                # Останавливаем текущий экземпляр
-                try:
-                    bot_instance.stop_polling()
-                except:
-                    pass
-                
-                # Даем время старому экземпляру завершиться
-                time.sleep(30)
-                
-                # Создаем нового бота
-                continue
+                # Выходим из программы
+                stop_bot()
+                sys.exit(1)
                 
             else:
                 print(f"❌ Ошибка Telegram API: {e}")
