@@ -40,9 +40,6 @@ adapter = HTTPAdapter(max_retries=retry)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
-# Список популярных криптовалют для подсказок
-POPULAR_COINS = ["BTC", "ETH", "SOL", "ADA", "BNB", "XRP", "DOGE", "DOT", "AVAX", "MATIC", "LINK", "UNI", "LTC", "ATOM"]
-
 def create_bot():
     """Создает новый экземпляр бота"""
     global bot_instance
@@ -138,70 +135,109 @@ def get_user_alerts(user_id):
 
 def get_current_price(symbol):
     try:
-        # Убираем USDT если уже есть в символе
-        if symbol.endswith('USDT'):
-            full_symbol = symbol
+        # Очищаем символ от лишних символов
+        clean_symbol = symbol.upper().replace('/', '').replace('\\', '').replace('-', '').replace('_', '')
+        
+        # Проверяем различные варианты формата символа
+        symbol_variants = []
+        
+        if clean_symbol.endswith('USDT'):
+            symbol_variants.append(clean_symbol)
+            symbol_variants.append(clean_symbol[:-4])  # Без USDT
         else:
-            full_symbol = f"{symbol.upper()}USDT"
+            symbol_variants.append(f"{clean_symbol}USDT")
+            symbol_variants.append(clean_symbol)
         
-        url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={full_symbol}"
-        response = session.get(url, timeout=5)
+        # Уникальные варианты
+        symbol_variants = list(set(symbol_variants))
         
-        if response.status_code != 200:
-            print(f"❌ API вернул статус {response.status_code} для {symbol}")
-            return None, symbol
+        for sym in symbol_variants:
+            try:
+                url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={sym}"
+                response = session.get(url, timeout=5)
+                
+                if response.status_code != 200:
+                    continue
+                
+                data = response.json()
+                
+                # Проверяем структуру ответа
+                if data.get('retCode') == 0 and 'result' in data and 'list' in data['result']:
+                    tickers = data['result']['list']
+                    if tickers:
+                        ticker = tickers[0]
+                        
+                        # Пробуем разные поля с ценой
+                        if 'lastPrice' in ticker and ticker['lastPrice']:
+                            current_price = float(ticker['lastPrice'])
+                            return current_price, sym
+                        elif 'markPrice' in ticker and ticker['markPrice']:
+                            current_price = float(ticker['markPrice'])
+                            return current_price, sym
+                        elif 'indexPrice' in ticker and ticker['indexPrice']:
+                            current_price = float(ticker['indexPrice'])
+                            return current_price, sym
+            except:
+                continue
         
-        data = response.json()
+        # Если не нашли в споте, пробуем другие категории
+        for category in ['linear', 'inverse']:
+            for sym in symbol_variants:
+                try:
+                    url = f"https://api.bybit.com/v5/market/tickers?category={category}&symbol={sym}"
+                    response = session.get(url, timeout=5)
+                    
+                    if response.status_code != 200:
+                        continue
+                    
+                    data = response.json()
+                    
+                    if data.get('retCode') == 0 and 'result' in data and 'list' in data['result']:
+                        tickers = data['result']['list']
+                        if tickers:
+                            ticker = tickers[0]
+                            
+                            if 'lastPrice' in ticker and ticker['lastPrice']:
+                                current_price = float(ticker['lastPrice'])
+                                return current_price, sym
+                except:
+                    continue
         
-        # Проверяем структуру ответа
-        if data.get('retCode') != 0:
-            error_msg = data.get('retMsg', 'Unknown error')
-            print(f"❌ Ошибка API для {symbol}: {error_msg}")
-            return None, symbol
+        # Пробуем получить все тикеры и найти нужный
+        try:
+            url = "https://api.bybit.com/v5/market/tickers?category=spot"
+            response = session.get(url, timeout=10)
             
-        if 'result' not in data or 'list' not in data['result']:
-            print(f"❌ Неверная структура ответа API для {symbol}")
-            return None, symbol
-            
-        tickers = data['result']['list']
-        if not tickers:
-            print(f"❌ Нет данных для символа {symbol} (пустой список)")
-            return None, symbol
-            
-        # Берем первый тикер из списка
-        ticker = tickers[0]
+            if response.status_code == 200:
+                data = response.json()
+                
+                if data.get('retCode') == 0 and 'result' in data and 'list' in data['result']:
+                    tickers = data['result']['list']
+                    
+                    # Ищем похожий символ
+                    for ticker in tickers:
+                        ticker_symbol = ticker.get('symbol', '').upper()
+                        
+                        # Проверяем различные варианты
+                        for sym in symbol_variants:
+                            if sym in ticker_symbol or ticker_symbol.replace('USDT', '') == sym.replace('USDT', ''):
+                                if 'lastPrice' in ticker and ticker['lastPrice']:
+                                    current_price = float(ticker['lastPrice'])
+                                    return current_price, ticker_symbol
+        except:
+            pass
         
-        # Пробуем разные поля с ценой
-        if 'lastPrice' in ticker and ticker['lastPrice']:
-            current_price = float(ticker['lastPrice'])
-        elif 'markPrice' in ticker and ticker['markPrice']:
-            current_price = float(ticker['markPrice'])
-        elif 'indexPrice' in ticker and ticker['indexPrice']:
-            current_price = float(ticker['indexPrice'])
-        else:
-            print(f"❌ Не найдено поле с ценой для {symbol}")
-            return None, symbol
-        
-        print(f"✅ Цена получена: {full_symbol} = ${current_price}")
-        return current_price, full_symbol
-        
-    except requests.exceptions.Timeout:
-        print(f"⏰ Таймаут при запросе цены для {symbol}")
+        print(f"❌ Не удалось найти цену для {symbol}")
         return None, symbol
-    except requests.exceptions.ConnectionError:
-        print(f"🔌 Ошибка соединения для {symbol}")
-        return None, symbol
+        
     except Exception as e:
-        print(f"❌ Ошибка получения цены для {symbol}: {str(e)[:100]}")
+        print(f"❌ Ошибка получения цены для {symbol}: {str(e)[:200]}")
         return None, symbol
 
-def get_popular_coins_list():
-    """Формирует список популярных монет для подсказки"""
-    coins_text = ""
-    for i in range(0, len(POPULAR_COINS), 4):
-        chunk = POPULAR_COINS[i:i+4]
-        coins_text += "• " + ", ".join(chunk) + "\n"
-    return coins_text.strip()
+def check_symbol_exists(symbol):
+    """Проверяет, существует ли символ на Bybit"""
+    price, found_symbol = get_current_price(symbol)
+    return price is not None, found_symbol
 
 def determine_alert_type(current_price, target_price):
     """Определяем тип алерта: UP (рост) или DOWN (падение)"""
@@ -245,15 +281,14 @@ def setup_bot_handlers(bot):
         welcome_text = """💰 Привет! Я бот для отслеживания цен криптовалют на Bybit.
 
 📊 Просто напиши: ТИКЕР ЦЕНА
-Пример: BTC 50000
+Пример: BTC 50000 или MYX 0.1
 
 Я буду следить и пришлю уведомление, когда цена достигнет указанного значения.
 
 📈 Для роста цены (BUY) укажи цену ВЫШЕ текущей
 📉 Для падения цены (SELL) укажи цену НИЖЕ текущей
 
-✨ Популярные тикеры:
-""" + get_popular_coins_list()
+✨ Популярные тикеры: BTC, ETH, SOL, ADA, BNB, XRP, DOGE, DOT, AVAX, MATIC, LINK, UNI, LTC, ATOM"""
         
         bot.send_message(message.chat.id, welcome_text)
     
@@ -268,17 +303,45 @@ def setup_bot_handlers(bot):
 /myalerts - Мои активные алерты
 /checknow - Проверить все алерты сейчас
 /clear - Удалить все мои алерты
+/search SYMBOL - Поиск монеты на Bybit
 
 📝 Как установить алерт:
 Просто напиши: ТИКЕР ЦЕНА
 Пример: ETH 3500
          SOL 100
          ADA 0.5
+         MYX 0.1
 
-📈 Популярные тикеры:
-""" + get_popular_coins_list()
+💡 Подсказки:
+• Можно вводить тикеры с USDT или без (BTC или BTCUSDT)
+• Цена должна быть числом (можно с точкой)
+• Бот поддерживает ВСЕ монеты, доступные на Bybit"""
         
         bot.send_message(message.chat.id, help_text)
+    
+    @bot.message_handler(commands=['search'])
+    def search_coin(message):
+        """Поиск монеты на Bybit"""
+        try:
+            parts = message.text.split()
+            if len(parts) < 2:
+                bot.send_message(message.chat.id, "❌ Используй: /search ТИКЕР\nПример: /search MYX")
+                return
+            
+            symbol = parts[1].upper()
+            exists, found_symbol = check_symbol_exists(symbol)
+            
+            if exists:
+                price, _ = get_current_price(symbol)
+                if price:
+                    bot.send_message(message.chat.id, f"✅ Монета найдена!\n\n📈 Символ: {found_symbol}\n💰 Цена: ${price:,.8f}\n\nТеперь можешь установить алерт:\n{symbol} {price * 1.1:.8f}")
+                else:
+                    bot.send_message(message.chat.id, f"✅ Монета найдена: {found_symbol}\n\nНо не удалось получить текущую цену.")
+            else:
+                bot.send_message(message.chat.id, f"❌ Монета '{symbol}' не найдена на Bybit.\n\nПопробуй:\n• Проверить правильность написания\n• Убедиться, что монета торгуется на Bybit\n• Попробовать другой тикер")
+                
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Ошибка поиска: {str(e)[:100]}")
     
     @bot.message_handler(commands=['status'])
     def status(message):
@@ -302,7 +365,8 @@ def setup_bot_handlers(bot):
 ⚡ Команды:
 /help - справка
 /testprice - проверить цену
-/myalerts - мои алерты"""
+/myalerts - мои алерты
+/search - поиск монеты"""
         
         bot.send_message(message.chat.id, status_text)
     
@@ -310,32 +374,29 @@ def setup_bot_handlers(bot):
     def test_bot(message):
         """Тестовая команда для проверки работы бота"""
         try:
-            # Проверяем цену BTC
-            btc_price, btc_symbol = get_current_price("BTC")
+            # Проверяем несколько популярных монет
+            test_results = []
             
-            if btc_price:
-                test_text = f"""🧪 ТЕСТ БОТА УСПЕШЕН!
+            for symbol in ["BTC", "ETH", "SOL", "ADA"]:
+                price, found_symbol = get_current_price(symbol)
+                if price:
+                    test_results.append(f"✅ {found_symbol}: ${price:,.2f}")
+                else:
+                    test_results.append(f"❌ {symbol}: не найдено")
+            
+            test_text = f"""🧪 ТЕСТ БОТА:
 
-✅ Все системы работают:
-• Подключение к Telegram: ✓
-• Подключение к Bybit API: ✓
-• База данных: ✓
+{chr(10).join(test_results)}
 
-📊 Текущая цена:
-{btc_symbol}: ${btc_price:,.2f}
+📊 Результат: {len([r for r in test_results if '✅' in r])}/4 монет найдено
 
 🚀 Бот готов к работе!"""
-            else:
-                test_text = """⚠️ ТЕСТ БОТА С ОШИБКАМИ
-
-❌ Проблемы с подключением к Bybit API
-Проверьте интернет соединение или попробуйте позже."""
             
             bot.send_message(message.chat.id, test_text)
             
         except Exception as e:
             bot.send_message(message.chat.id, f"❌ Ошибка теста: {str(e)[:100]}")
-
+    
     @bot.message_handler(commands=['testalert'])
     def test_alert_command(message):
         """Создание тестового алерта"""
@@ -401,139 +462,29 @@ def setup_bot_handlers(bot):
 
         bot.send_message(message.chat.id, stats_text)
     
-    @bot.message_handler(commands=['detailed_stats'])
-    def detailed_stats(message):
-        """Детальная статистика (только для администратора)"""
-        if not is_admin(message.from_user.id):
-            bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
-            return
-            
-        conn = sqlite3.connect('alerts.db', check_same_thread=False)
-        cursor = conn.cursor()
-        
-        # Основная статистика
-        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users')
-        total_users = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(*) FROM alerts')
-        total_alerts = cursor.fetchone()[0]
-        
-        # Активные пользователи за разные периоды
-        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-1 day")')
-        active_1d = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-7 days")')
-        active_7d = cursor.fetchone()[0]
-        
-        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-30 days")')
-        active_30d = cursor.fetchone()[0]
-        
-        # Популярные монеты
-        cursor.execute('SELECT symbol, COUNT(*) as count FROM alerts GROUP BY symbol ORDER BY count DESC LIMIT 5')
-        popular_coins = cursor.fetchall()
-        
-        conn.close()
-        
-        stats_text = f"""📊 ДЕТАЛЬНАЯ СТАТИСТИКА:
-
-👥 Всего пользователей: {total_users}
-🔔 Всего алертов: {total_alerts}
-
-🎯 Активность:
-• За 24 часа: {active_1d} пользователей
-• За 7 дней: {active_7d} пользователей  
-• За 30 дней: {active_30d} пользователей
-
-🏆 Популярные монеты:
-"""
-        
-        for coin, count in popular_coins:
-            stats_text += f"• {coin}: {count} алертов\n"
-        
-        bot.send_message(message.chat.id, stats_text)
-    
-    @bot.message_handler(commands=['userlist'])
-    def user_list(message):
-        """Список всех пользователей (только для администратора)"""
-        if not is_admin(message.from_user.id):
-            bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
-            return
-            
-        conn = sqlite3.connect('alerts.db', check_same_thread=False)
-        cursor = conn.cursor()
-        
-        # Получаем всех пользователей с количеством их алертов
-        cursor.execute('''
-        SELECT u.user_id, u.username, u.first_name, u.last_name, u.created_at, u.last_activity, 
-               COUNT(a.id) as alert_count
-        FROM users u 
-        LEFT JOIN alerts a ON u.user_id = a.user_id 
-        GROUP BY u.user_id 
-        ORDER BY u.created_at DESC
-        ''')
-        users = cursor.fetchall()
-        
-        conn.close()
-        
-        if not users:
-            bot.send_message(message.chat.id, "📭 В базе нет пользователей")
-            return
-        
-        # Разбиваем на части, если пользователей много
-        user_count = len(users)
-        response = f"👥 ВСЕ ПОЛЬЗОВАТЕЛИ: {user_count}\n\n"
-        
-        for i, user in enumerate(users, 1):
-            user_id, username, first_name, last_name, created_at, last_activity, alert_count = user
-            
-            # Форматируем даты
-            created = created_at[:16] if created_at else "неизвестно"
-            last_active = last_activity[:16] if last_activity else "неизвестно"
-            
-            user_info = f"#{i} 👤 ID: {user_id}\n"
-            if username:
-                user_info += f"   @{username}\n"
-            if first_name:
-                user_info += f"   Имя: {first_name}"
-                if last_name:
-                    user_info += f" {last_name}"
-                user_info += "\n"
-            user_info += f"   📅 Регистрация: {created}\n"
-            user_info += f"   ⏰ Последняя активность: {last_active}\n"
-            user_info += f"   🔔 Алертов: {alert_count}\n"
-            user_info += "   ───────────────────\n"
-            
-            # Если сообщение становится слишком длинным, отправляем и начинаем новое
-            if len(response + user_info) > 4000:
-                bot.send_message(message.chat.id, response)
-                response = "👥 ПРОДОЛЖЕНИЕ:\n\n" + user_info
-            else:
-                response += user_info
-        
-        bot.send_message(message.chat.id, response)
-    
     @bot.message_handler(commands=['testprice'])
     def test_price(message):
         """Проверка текущей цены"""
         try:
-            symbol = "BTC"
-            current_price, full_symbol = get_current_price(symbol)
+            # Получаем цены нескольких популярных монет
+            symbols_to_check = ["BTC", "ETH", "SOL", "BNB"]
+            results = []
             
-            if current_price:
-                # Также проверяем ETH для демонстрации
-                eth_price, eth_symbol = get_current_price("ETH")
-                
-                response = f"""🧪 ТЕКУЩИЕ ЦЕНЫ:
+            for symbol in symbols_to_check:
+                current_price, full_symbol = get_current_price(symbol)
+                if current_price:
+                    results.append(f"{full_symbol}: ${current_price:,.2f}")
+                else:
+                    results.append(f"{symbol}: не найдено")
+            
+            response = f"""🧪 ТЕКУЩИЕ ЦЕНЫ:
 
-{full_symbol}
-💰 ${current_price:,.2f}"""
-                
-                if eth_price:
-                    response += f"\n\n{eth_symbol}\n💰 ${eth_price:,.2f}"
-                
-                bot.send_message(message.chat.id, response)
-            else:
-                bot.send_message(message.chat.id, "❌ Не удалось получить цену BTC")
+{chr(10).join(results)}
+
+💡 Попробуй: /search ТИКЕР
+Пример: /search MYX"""
+            
+            bot.send_message(message.chat.id, response)
                 
         except Exception as e:
             bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)[:100]}")
@@ -544,13 +495,13 @@ def setup_bot_handlers(bot):
         alerts = get_user_alerts(user_id)
         
         if not alerts:
-            bot.send_message(message.chat.id, "📭 У тебя нет активных алертов.\n\nСоздай алерт командой:\nBTC 50000")
+            bot.send_message(message.chat.id, "📭 У тебя нет активных алертов.\n\nСоздай алерт командой:\nBTC 50000\nИли любой другой тикер с ценой")
         else:
             response = "📋 ТВОИ АКТИВНЫЕ АЛЕРТЫ:\n\n"
             for alert in alerts:
                 id, symbol, target_price, alert_type = alert
                 icon = "📈" if alert_type == "UP" else "📉"
-                response += f"• {icon} {symbol} -> ${target_price:,.2f}\n"
+                response += f"• {icon} {symbol} -> ${target_price:,.8f}\n"
             bot.send_message(message.chat.id, response)
     
     @bot.message_handler(commands=['checknow'])
@@ -584,7 +535,11 @@ def setup_bot_handlers(bot):
                     diff_percent = (diff / target_price) * 100
                     diff_text = f"+{diff_percent:.2f}%" if diff > 0 else f"{diff_percent:.2f}%"
                     
-                    response += f"• {icon} {full_symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} ({diff_text}) - {status}\n"
+                    # Форматируем цену в зависимости от размера
+                    price_format = "${:,.8f}" if current_price_now < 0.01 else "${:,.2f}"
+                    target_format = "${:,.8f}" if target_price < 0.01 else "${:,.2f}"
+                    
+                    response += f"• {icon} {full_symbol}: {price_format.format(current_price_now)} / {target_format.format(target_price)} ({diff_text}) - {status}\n"
                 else:
                     response += f"• {symbol}: ❌ ошибка получения цены\n"
             
@@ -623,14 +578,14 @@ def setup_bot_handlers(bot):
             text = message.text.strip().split()
             
             if len(text) < 2:
-                bot.send_message(message.chat.id, "❌ Напиши в формате: ТИКЕР ЦЕНА\nНапример: BTC 50000")
+                bot.send_message(message.chat.id, "❌ Напиши в формате: ТИКЕР ЦЕНА\nНапример: BTC 50000 или MYX 0.1")
                 return
 
-            symbol = text[0].upper().replace('$', '').replace(',', '')
+            symbol = text[0].upper().replace('$', '').replace(',', '').replace('/', '')
             try:
                 target_price = float(text[1].replace('$', '').replace(',', ''))
             except ValueError:
-                bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или ETH 3500.50")
+                bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или MYX 0.12345678")
                 return
 
             # Проверяем валидность цены
@@ -642,13 +597,17 @@ def setup_bot_handlers(bot):
             current_price, full_symbol = get_current_price(symbol)
             
             if current_price is None:
-                error_text = f"""❌ Тикер '{symbol}' не найден на Bybit.
+                error_text = f"""❌ Не удалось найти '{symbol}' на Bybit.
 
-✨ Попробуй популярные тикеры:
-""" + get_popular_coins_list() + """
+💡 Возможные причины:
+• Тикер написан с ошибкой
+• Монета не торгуется на Bybit
+• Проблемы с API Bybit
 
-📌 Убедись, что вводишь правильный тикер
-📌 Только криптовалюты с парами USDT"""
+✨ Попробуй:
+• Проверить правильность тикера
+• Использовать команду /search {symbol}
+• Попробовать популярные тикеры: BTC, ETH, SOL, ADA"""
                 
                 bot.send_message(message.chat.id, error_text)
                 return
@@ -661,11 +620,19 @@ def setup_bot_handlers(bot):
             # Добавляем алерт
             add_alert(user_id, full_symbol, target_price, current_price, alert_type)
             
+            # Форматируем цены в зависимости от их размера
+            if current_price < 0.01:
+                current_price_str = f"${current_price:,.8f}"
+                target_price_str = f"${target_price:,.8f}"
+            else:
+                current_price_str = f"${current_price:,.2f}"
+                target_price_str = f"${target_price:,.2f}"
+            
             response = f"""✅ АЛЕРТ УСТАНОВЛЕН!
 
 {full_symbol}
-💰 Текущая цена: ${current_price:,.2f}
-{alert_icon} Оповещение при: <b>${target_price:,.2f}</b>
+💰 Текущая цена: {current_price_str}
+{alert_icon} Оповещение при: <b>{target_price_str}</b>
 🎯 Направление: цена {direction}
 
 🔔 Бот будет проверять цену каждые 5 секунд."""
@@ -673,7 +640,7 @@ def setup_bot_handlers(bot):
             bot.send_message(message.chat.id, response, parse_mode='HTML')
             
         except ValueError:
-            bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или ETH 3500.50")
+            bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или MYX 0.12345678")
         except Exception as e:
             error_msg = str(e)[:100]
             bot.send_message(message.chat.id, f"❌ Ошибка: {error_msg}\nПопробуй еще раз")
@@ -720,7 +687,7 @@ def check_prices():
                             continue
                     
                     # Запрашиваем цену
-                    price, _ = get_current_price(symbol)
+                    price, found_symbol = get_current_price(symbol)
                     if price:
                         current_prices[symbol] = price
                         price_cache[symbol] = price
@@ -747,7 +714,14 @@ def check_prices():
                             try:
                                 icon = "📈" if alert_type == "UP" else "📉"
                                 direction = "выросла до" if alert_type == "UP" else "упала до"
-                                message_text = f"{icon} {symbol} {direction} ${target_price:,.2f}"
+                                
+                                # Форматируем цену
+                                if target_price < 0.01:
+                                    price_str = f"${target_price:,.8f}"
+                                else:
+                                    price_str = f"${target_price:,.2f}"
+                                
+                                message_text = f"{icon} {symbol} {direction} {price_str}"
                                 
                                 # Используем глобальный экземпляр бота для отправки
                                 global bot_instance
