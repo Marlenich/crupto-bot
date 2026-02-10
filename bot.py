@@ -40,6 +40,9 @@ adapter = HTTPAdapter(max_retries=retry)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
+# Список популярных криптовалют для подсказок
+POPULAR_COINS = ["BTC", "ETH", "SOL", "ADA", "BNB", "XRP", "DOGE", "DOT", "AVAX", "MATIC", "LINK", "UNI", "LTC", "ATOM"]
+
 def create_bot():
     """Создает новый экземпляр бота"""
     global bot_instance
@@ -106,6 +109,7 @@ def add_alert(user_id, symbol, target_price, current_price, alert_type):
                    (user_id, symbol.upper(), target_price, current_price, alert_type))
     conn.commit()
     conn.close()
+    print(f"✅ Добавлен алерт: {symbol} {alert_type} ${target_price}")
 
 def get_active_alerts():
     """Получаем только не сработавшие алерты"""
@@ -141,18 +145,27 @@ def get_current_price(symbol):
             full_symbol = f"{symbol.upper()}USDT"
         
         url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={full_symbol}"
-        response = session.get(url, timeout=3)
+        response = session.get(url, timeout=5)
+        
+        if response.status_code != 200:
+            print(f"❌ API вернул статус {response.status_code} для {symbol}")
+            return None, symbol
+        
         data = response.json()
         
         # Проверяем структуру ответа
         if data.get('retCode') != 0:
+            error_msg = data.get('retMsg', 'Unknown error')
+            print(f"❌ Ошибка API для {symbol}: {error_msg}")
             return None, symbol
             
         if 'result' not in data or 'list' not in data['result']:
+            print(f"❌ Неверная структура ответа API для {symbol}")
             return None, symbol
             
         tickers = data['result']['list']
         if not tickers:
+            print(f"❌ Нет данных для символа {symbol} (пустой список)")
             return None, symbol
             
         # Берем первый тикер из списка
@@ -166,12 +179,29 @@ def get_current_price(symbol):
         elif 'indexPrice' in ticker and ticker['indexPrice']:
             current_price = float(ticker['indexPrice'])
         else:
+            print(f"❌ Не найдено поле с ценой для {symbol}")
             return None, symbol
         
+        print(f"✅ Цена получена: {full_symbol} = ${current_price}")
         return current_price, full_symbol
         
-    except Exception as e:
+    except requests.exceptions.Timeout:
+        print(f"⏰ Таймаут при запросе цены для {symbol}")
         return None, symbol
+    except requests.exceptions.ConnectionError:
+        print(f"🔌 Ошибка соединения для {symbol}")
+        return None, symbol
+    except Exception as e:
+        print(f"❌ Ошибка получения цены для {symbol}: {str(e)[:100]}")
+        return None, symbol
+
+def get_popular_coins_list():
+    """Формирует список популярных монет для подсказки"""
+    coins_text = ""
+    for i in range(0, len(POPULAR_COINS), 4):
+        chunk = POPULAR_COINS[i:i+4]
+        coins_text += "• " + ", ".join(chunk) + "\n"
+    return coins_text.strip()
 
 def determine_alert_type(current_price, target_price):
     """Определяем тип алерта: UP (рост) или DOWN (падение)"""
@@ -212,14 +242,132 @@ def setup_bot_handlers(bot):
         conn.commit()
         conn.close()
         
-        bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипто монет на Bybit.\n\nПросто напиши: BTC 50000 (пример)\n\nЯ пришлю уведомление когда цена достигнет указанных значений")
+        welcome_text = """💰 Привет! Я бот для отслеживания цен криптовалют на Bybit.
+
+📊 Просто напиши: ТИКЕР ЦЕНА
+Пример: BTC 50000
+
+Я буду следить и пришлю уведомление, когда цена достигнет указанного значения.
+
+📈 Для роста цены (BUY) укажи цену ВЫШЕ текущей
+📉 Для падения цены (SELL) укажи цену НИЖЕ текущей
+
+✨ Популярные тикеры:
+""" + get_popular_coins_list()
+        
+        bot.send_message(message.chat.id, welcome_text)
+    
+    @bot.message_handler(commands=['help'])
+    def send_help(message):
+        help_text = """🆘 ПОМОЩЬ ПО КОМАНДАМ:
+
+/start - Запустить бота
+/help - Эта справка
+/status - Статус бота
+/testprice - Проверить цену BTC
+/myalerts - Мои активные алерты
+/checknow - Проверить все алерты сейчас
+/clear - Удалить все мои алерты
+
+📝 Как установить алерт:
+Просто напиши: ТИКЕР ЦЕНА
+Пример: ETH 3500
+         SOL 100
+         ADA 0.5
+
+📈 Популярные тикеры:
+""" + get_popular_coins_list()
+        
+        bot.send_message(message.chat.id, help_text)
     
     @bot.message_handler(commands=['status'])
     def status(message):
         active_alerts = get_active_alerts()
         alerts_count = len(active_alerts)
         
-        bot.send_message(message.chat.id, f"✅ Бот работает!\nАктивных алертов: {alerts_count}\n\nИспользуй:\n/testprice - проверить цену\n/myalerts - мои алерты")
+        # Проверяем текущую цену BTC для демонстрации
+        btc_price, btc_symbol = get_current_price("BTC")
+        if btc_price:
+            price_info = f"\n💰 {btc_symbol}: ${btc_price:,.2f}"
+        else:
+            price_info = "\n⚠️ Не удалось получить цену BTC"
+        
+        status_text = f"""✅ БОТ РАБОТАЕТ!
+
+📊 Статистика:
+• Активных алертов: {alerts_count}
+• Проверка каждые: 5 секунд
+• Источник цен: Bybit API{price_info}
+
+⚡ Команды:
+/help - справка
+/testprice - проверить цену
+/myalerts - мои алерты"""
+        
+        bot.send_message(message.chat.id, status_text)
+    
+    @bot.message_handler(commands=['test'])
+    def test_bot(message):
+        """Тестовая команда для проверки работы бота"""
+        try:
+            # Проверяем цену BTC
+            btc_price, btc_symbol = get_current_price("BTC")
+            
+            if btc_price:
+                test_text = f"""🧪 ТЕСТ БОТА УСПЕШЕН!
+
+✅ Все системы работают:
+• Подключение к Telegram: ✓
+• Подключение к Bybit API: ✓
+• База данных: ✓
+
+📊 Текущая цена:
+{btc_symbol}: ${btc_price:,.2f}
+
+🚀 Бот готов к работе!"""
+            else:
+                test_text = """⚠️ ТЕСТ БОТА С ОШИБКАМИ
+
+❌ Проблемы с подключением к Bybit API
+Проверьте интернет соединение или попробуйте позже."""
+            
+            bot.send_message(message.chat.id, test_text)
+            
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Ошибка теста: {str(e)[:100]}")
+
+    @bot.message_handler(commands=['testalert'])
+    def test_alert_command(message):
+        """Создание тестового алерта"""
+        user_id = message.from_user.id
+        try:
+            symbol = "BTC"
+            current_price, full_symbol = get_current_price(symbol)
+            
+            if current_price:
+                # Создаем тестовый алерт на $1 выше текущей цены
+                test_target = current_price + 1
+                
+                alert_type = determine_alert_type(current_price, test_target)
+                alert_icon = "📈" if alert_type == "UP" else "📉"
+                
+                add_alert(user_id, full_symbol, test_target, current_price, alert_type)
+                
+                test_text = f"""🧪 ТЕСТОВЫЙ АЛЕРТ СОЗДАН!
+
+{full_symbol}
+💰 Текущая цена: ${current_price:,.2f}
+{alert_icon} Оповещение при: <b>${test_target:,.2f}</b>
+
+Алерт будет проверяться каждые 5 секунд.
+Цена должна немного вырасти для срабатывания."""
+                
+                bot.send_message(message.chat.id, test_text, parse_mode='HTML')
+            else:
+                bot.send_message(message.chat.id, "❌ Не удалось получить текущую цену BTC")
+                
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)[:100]}")
     
     @bot.message_handler(commands=['stats'])
     def show_stats(message):
@@ -372,13 +520,23 @@ def setup_bot_handlers(bot):
             current_price, full_symbol = get_current_price(symbol)
             
             if current_price:
-                response = f"🧪 ТЕКУЩАЯ ЦЕНА:\n\n{full_symbol}\n💰 ${current_price:,.2f}"
+                # Также проверяем ETH для демонстрации
+                eth_price, eth_symbol = get_current_price("ETH")
+                
+                response = f"""🧪 ТЕКУЩИЕ ЦЕНЫ:
+
+{full_symbol}
+💰 ${current_price:,.2f}"""
+                
+                if eth_price:
+                    response += f"\n\n{eth_symbol}\n💰 ${eth_price:,.2f}"
+                
                 bot.send_message(message.chat.id, response)
             else:
                 bot.send_message(message.chat.id, "❌ Не удалось получить цену BTC")
                 
         except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+            bot.send_message(message.chat.id, f"❌ Ошибка: {str(e)[:100]}")
     
     @bot.message_handler(commands=['myalerts'])
     def list_alerts(message):
@@ -386,13 +544,13 @@ def setup_bot_handlers(bot):
         alerts = get_user_alerts(user_id)
         
         if not alerts:
-            bot.send_message(message.chat.id, "У тебя нет активных запросов.")
+            bot.send_message(message.chat.id, "📭 У тебя нет активных алертов.\n\nСоздай алерт командой:\nBTC 50000")
         else:
-            response = "📋 Твои активные запросы:\n\n"
+            response = "📋 ТВОИ АКТИВНЫЕ АЛЕРТЫ:\n\n"
             for alert in alerts:
                 id, symbol, target_price, alert_type = alert
                 icon = "📈" if alert_type == "UP" else "📉"
-                response += f"• {icon} {symbol} -> ${target_price:,.2f} ({alert_type})\n"
+                response += f"• {icon} {symbol} -> ${target_price:,.2f}\n"
             bot.send_message(message.chat.id, response)
     
     @bot.message_handler(commands=['checknow'])
@@ -403,29 +561,40 @@ def setup_bot_handlers(bot):
             alerts = get_user_alerts(user_id)
             
             if not alerts:
-                bot.send_message(message.chat.id, "У тебя нет активных алертов")
+                bot.send_message(message.chat.id, "📭 У тебя нет активных алертов")
                 return
                 
-            response = "🔍 Твои алерты:\n\n"
+            response = "🔍 ПРОВЕРКА АЛЕРТОВ:\n\n"
+            triggered_count = 0
+            
             for alert in alerts:
                 id, symbol, target_price, alert_type = alert
-                current_price_now, _ = get_current_price(symbol)
+                current_price_now, full_symbol = get_current_price(symbol)
                 
                 if current_price_now:
                     icon = "📈" if alert_type == "UP" else "📉"
-                    status = "✅ ГОТОВ!" if should_trigger_alert(current_price_now, target_price, alert_type) else "⏳ жду"
+                    
+                    if should_trigger_alert(current_price_now, target_price, alert_type):
+                        status = "✅ ГОТОВ!"
+                        triggered_count += 1
+                    else:
+                        status = "⏳ жду"
+                    
                     diff = current_price_now - target_price
                     diff_percent = (diff / target_price) * 100
                     diff_text = f"+{diff_percent:.2f}%" if diff > 0 else f"{diff_percent:.2f}%"
                     
-                    response += f"• {icon} {symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} ({diff_text}) - {status}\n"
+                    response += f"• {icon} {full_symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} ({diff_text}) - {status}\n"
                 else:
-                    response += f"• {symbol}: ошибка получения цены\n"
+                    response += f"• {symbol}: ❌ ошибка получения цены\n"
+            
+            if triggered_count > 0:
+                response += f"\n🎯 Готово к отправке: {triggered_count} алертов"
             
             bot.send_message(message.chat.id, response)
             
         except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Ошибка проверки: {e}")
+            bot.send_message(message.chat.id, f"❌ Ошибка проверки: {str(e)[:100]}")
     
     @bot.message_handler(commands=['clear'])
     def clear_alerts(message):
@@ -436,44 +605,79 @@ def setup_bot_handlers(bot):
         count = cursor.rowcount
         conn.commit()
         conn.close()
-        bot.send_message(message.chat.id, f"✅ Удалено {count} алертов!")
+        
+        if count > 0:
+            bot.send_message(message.chat.id, f"✅ Удалено {count} алертов!")
+        else:
+            bot.send_message(message.chat.id, "📭 У тебя не было активных алертов")
     
     # Установка алерта
     @bot.message_handler(func=lambda message: True)
     def set_alert(message):
+        # Пропускаем команды
+        if message.text.startswith('/'):
+            return
+            
         try:
             user_id = message.from_user.id
-            text = message.text.split()
+            text = message.text.strip().split()
             
             if len(text) < 2:
                 bot.send_message(message.chat.id, "❌ Напиши в формате: ТИКЕР ЦЕНА\nНапример: BTC 50000")
                 return
 
-            symbol = text[0].upper()
-            target_price = float(text[1])
+            symbol = text[0].upper().replace('$', '').replace(',', '')
+            try:
+                target_price = float(text[1].replace('$', '').replace(',', ''))
+            except ValueError:
+                bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или ETH 3500.50")
+                return
 
+            # Проверяем валидность цены
+            if target_price <= 0:
+                bot.send_message(message.chat.id, "❌ Цена должна быть больше нуля!")
+                return
+
+            # Получаем текущую цену
             current_price, full_symbol = get_current_price(symbol)
             
             if current_price is None:
-                bot.send_message(message.chat.id, f"❌ Тикер '{symbol}' не найден. Попробуй: BTC, ETH, SOL, ADA")
+                error_text = f"""❌ Тикер '{symbol}' не найден на Bybit.
+
+✨ Попробуй популярные тикеры:
+""" + get_popular_coins_list() + """
+
+📌 Убедись, что вводишь правильный тикер
+📌 Только криптовалюты с парами USDT"""
+                
+                bot.send_message(message.chat.id, error_text)
                 return
 
             # Определяем тип алерта
             alert_type = determine_alert_type(current_price, target_price)
             alert_icon = "📈" if alert_type == "UP" else "📉"
+            direction = "выше текущей" if alert_type == "UP" else "ниже текущей"
 
+            # Добавляем алерт
             add_alert(user_id, full_symbol, target_price, current_price, alert_type)
             
-            response = f"""{full_symbol}
+            response = f"""✅ АЛЕРТ УСТАНОВЛЕН!
+
+{full_symbol}
 💰 Текущая цена: ${current_price:,.2f}
-{alert_icon} Оповещение при: <b>${target_price:,.2f}</b>"""
+{alert_icon} Оповещение при: <b>${target_price:,.2f}</b>
+🎯 Направление: цена {direction}
+
+🔔 Бот будет проверять цену каждые 5 секунд."""
 
             bot.send_message(message.chat.id, response, parse_mode='HTML')
             
         except ValueError:
             bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или ETH 3500.50")
         except Exception as e:
-            bot.send_message(message.chat.id, "❌ Ошибка, попробуй еще раз")
+            error_msg = str(e)[:100]
+            bot.send_message(message.chat.id, f"❌ Ошибка: {error_msg}\nПопробуй еще раз")
+            print(f"❌ Ошибка установки алерта: {e}")
 
 # Фоновая проверка цен
 def check_prices():
@@ -484,9 +688,15 @@ def check_prices():
     cache_time = {}
     CACHE_DURATION = 5  # секунды
     
+    iteration = 0
+    
     while not stop_threads:
         try:
+            iteration += 1
             alerts = get_active_alerts()
+            
+            if alerts and iteration % 10 == 0:  # Логируем каждые 10 итераций
+                print(f"🔍 Проверяю {len(alerts)} активных алертов (итерация {iteration})...")
             
             if alerts:
                 # Группируем алерты по символам
@@ -523,6 +733,7 @@ def check_prices():
                             del cache_time[symbol]
                 
                 # Проверяем алерты
+                triggered_count = 0
                 for symbol, symbol_alerts in alerts_by_symbol.items():
                     if symbol not in current_prices:
                         continue
@@ -542,8 +753,10 @@ def check_prices():
                                 global bot_instance
                                 if bot_instance:
                                     bot_instance.send_message(user_id, message_text)
+                                    print(f"✅ Уведомление отправлено: {symbol} для пользователя {user_id}")
                                 
                                 mark_alert_triggered(alert_id)
+                                triggered_count += 1
                                 
                                 # Удаляем из кэша
                                 if symbol in price_cache:
@@ -551,14 +764,17 @@ def check_prices():
                                 if symbol in cache_time:
                                     del cache_time[symbol]
                                     
-                            except Exception:
-                                # Игнорируем ошибки отправки
-                                pass
+                            except Exception as e:
+                                print(f"❌ Ошибка отправки уведомления: {str(e)[:100]}")
+                
+                if triggered_count > 0:
+                    print(f"🎯 Сработало {triggered_count} алертов")
             
             # Ждем 5 секунд между проверками
             time.sleep(5)
                         
-        except Exception:
+        except Exception as e:
+            print(f"❌ Ошибка в фоновой проверке: {str(e)[:100]}")
             time.sleep(5)
 
 def stop_bot():
@@ -621,12 +837,15 @@ def run_bot():
             print("🤖 Бот начинает опрос Telegram...")
             
             # Очищаем webhook на всякий случай
-            bot_instance.remove_webhook()
-            time.sleep(1)
+            try:
+                bot_instance.remove_webhook()
+                time.sleep(1)
+            except:
+                pass
             
             # Запускаем polling с коротким таймаутом
             polling_active = True
-            bot_instance.polling(none_stop=True, interval=1, timeout=20)
+            bot_instance.polling(none_stop=True, interval=1, timeout=20, long_polling_timeout=20)
             
         except telebot.apihelper.ApiTelegramException as e:
             polling_active = False
