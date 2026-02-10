@@ -4,8 +4,15 @@ import requests
 import time
 import os
 import threading
+import logging
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 print("=== БОТ ЗАПУЩЕН НА RAILWAY ===")
+
+# Настройка логирования
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Токен бота
 TELEGRAM_BOT_TOKEN = '7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU'
@@ -19,9 +26,20 @@ if not TELEGRAM_BOT_TOKEN:
 
 print(f"✅ Токен получен! Длина: {len(TELEGRAM_BOT_TOKEN)} символов")
 
+# Создаем сессию requests с повторными попытками
+session = requests.Session()
+retry = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[500, 502, 503, 504, 429],
+)
+adapter = HTTPAdapter(max_retries=retry)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
+
 # Создаем бота
 try:
-    bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode='HTML')
+    bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode='HTML', threaded=True)
     print("✅ Бот создан успешно!")
 except Exception as e:
     print(f"❌ Ошибка создания бота: {e}")
@@ -108,7 +126,6 @@ def mark_alert_triggered(alert_id):
     cursor.execute('UPDATE alerts SET triggered = 1 WHERE id = ?', (alert_id,))
     conn.commit()
     conn.close()
-    print(f"✅ Алерт {alert_id} помечен как сработавший")
 
 def delete_alert(alert_id):
     conn = sqlite3.connect('alerts.db', check_same_thread=False)
@@ -116,7 +133,6 @@ def delete_alert(alert_id):
     cursor.execute('DELETE FROM alerts WHERE id = ?', (alert_id,))
     conn.commit()
     conn.close()
-    print(f"✅ Удален алерт ID: {alert_id}")
 
 def get_user_alerts(user_id):
     conn = sqlite3.connect('alerts.db', check_same_thread=False)
@@ -128,30 +144,44 @@ def get_user_alerts(user_id):
 
 def get_current_price(symbol):
     try:
-        # Просто добавляем USDT к тикеру
-        symbol_upper = symbol.upper()
-        if symbol_upper.endswith('USDT'):
-            full_symbol = symbol_upper
+        # Убираем USDT если уже есть в символе
+        if symbol.endswith('USDT'):
+            full_symbol = symbol
         else:
-            full_symbol = f"{symbol_upper}USDT"
+            full_symbol = f"{symbol.upper()}USDT"
         
         url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={full_symbol}"
-        response = requests.get(url, timeout=2)  # Уменьшен таймаут до 2 секунд
+        response = session.get(url, timeout=3)  # Уменьшен таймаут
         data = response.json()
         
-        if data.get('retCode') == 0 and 'result' in data and 'list' in data['result']:
-            tickers = data['result']['list']
-            if tickers and len(tickers) > 0:
-                ticker = tickers[0]
-                if 'lastPrice' in ticker and ticker['lastPrice']:
-                    current_price = float(ticker['lastPrice'])
-                    return current_price, symbol_upper
+        # Проверяем структуру ответа
+        if data.get('retCode') != 0:
+            return None, symbol
+            
+        if 'result' not in data or 'list' not in data['result']:
+            return None, symbol
+            
+        tickers = data['result']['list']
+        if not tickers:
+            return None, symbol
+            
+        # Берем первый тикер из списка
+        ticker = tickers[0]
         
-        return None, symbol_upper
+        # Пробуем разные поля с ценой
+        if 'lastPrice' in ticker and ticker['lastPrice']:
+            current_price = float(ticker['lastPrice'])
+        elif 'markPrice' in ticker and ticker['markPrice']:
+            current_price = float(ticker['markPrice'])
+        elif 'indexPrice' in ticker and ticker['indexPrice']:
+            current_price = float(ticker['indexPrice'])
+        else:
+            return None, symbol
+        
+        return current_price, full_symbol
         
     except Exception as e:
-        print(f"❌ Ошибка получения цены для {symbol}: {e}")
-        return None, symbol_upper
+        return None, symbol
 
 def determine_alert_type(current_price, target_price):
     """Определяем тип алерта: UP (рост) или DOWN (падение)"""
@@ -190,18 +220,14 @@ def send_welcome(message):
     conn.close()
     
     print(f"👤 Пользователь {user_id} запустил бота")
-    bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипто монет на Bybit.\n\nПросто напиши: ТИКЕР ЦЕНА\nПример: BTC 50000\n\nЯ пришлю уведомление когда цена достигнет указанного значения.")
+    bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипто монет на Bybit.\n\nПросто напиши: BTC 50000 (пример)\n\nЯ пришлю уведомление когда цена достигнет указанных значений")
 
 @bot.message_handler(commands=['status'])
 def status(message):
     active_alerts = get_active_alerts()
     alerts_count = len(active_alerts)
     
-    # Проверяем текущую цену BTC для демонстрации
-    btc_price, _ = get_current_price("BTC")
-    price_info = f"\n💰 BTC сейчас: ${btc_price:,.2f}" if btc_price else ""
-    
-    bot.send_message(message.chat.id, f"✅ Бот работает!\nАктивных запросов: {alerts_count}{price_info}")
+    bot.send_message(message.chat.id, f"✅ Бот работает!\nАктивных алертов: {alerts_count}\n\nИспользуй:\n/testprice - проверить цену\n/myalerts - мои алерты")
 
 @bot.message_handler(commands=['stats'])
 def show_stats(message):
@@ -346,128 +372,19 @@ def user_list(message):
     
     bot.send_message(message.chat.id, response)
 
-@bot.message_handler(commands=['userinfo'])
-def user_info(message):
-    """Информация о конкретном пользователе (только для администратора)"""
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
-        return
-        
+@bot.message_handler(commands=['testprice'])
+def test_price(message):
+    """Проверка текущей цены"""
     try:
-        # Парсим команду: /userinfo 123456789
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.send_message(message.chat.id, "❌ Использование: /userinfo USER_ID\nПример: /userinfo 123456789")
-            return
-            
-        target_user_id = int(parts[1])
+        symbol = "BTC"
+        current_price, full_symbol = get_current_price(symbol)
         
-        conn = sqlite3.connect('alerts.db', check_same_thread=False)
-        cursor = conn.cursor()
-        
-        # Информация о пользователе
-        cursor.execute('SELECT * FROM users WHERE user_id = ?', (target_user_id,))
-        user_data = cursor.fetchone()
-        
-        if not user_data:
-            bot.send_message(message.chat.id, f"❌ Пользователь с ID {target_user_id} не найден")
-            conn.close()
-            return
-        
-        # Алерты пользователя
-        cursor.execute('SELECT symbol, target_price, alert_type, created_at FROM alerts WHERE user_id = ? ORDER BY created_at DESC', (target_user_id,))
-        user_alerts = cursor.fetchall()
-        
-        conn.close()
-        
-        user_id, username, first_name, last_name, created_at, last_activity = user_data
-        
-        response = f"👤 ДЕТАЛЬНАЯ ИНФОРМАЦИЯ О ПОЛЬЗОВАТЕЛЕ:\n\n"
-        response += f"🆔 ID: {user_id}\n"
-        response += f"👤 Username: @{username if username else 'не указан'}\n"
-        response += f"📛 Имя: {first_name if first_name else 'не указано'}\n"
-        response += f"📛 Фамилия: {last_name if last_name else 'не указана'}\n"
-        response += f"📅 Дата регистрации: {created_at}\n"
-        response += f"⏰ Последняя активность: {last_activity}\n"
-        response += f"🔔 Всего алертов: {len(user_alerts)}\n\n"
-        
-        if user_alerts:
-            response += "📋 ПОСЛЕДНИЕ АЛЕРТЫ:\n"
-            for i, alert in enumerate(user_alerts[:10], 1):  # Показываем последние 10
-                symbol, target_price, alert_type, created_at = alert
-                icon = "📈" if alert_type == "UP" else "📉"
-                response += f"{i}. {icon} {symbol} -> ${target_price:,.2f} ({created_at[:16]})\n"
-            if len(user_alerts) > 10:
-                response += f"\n... и еще {len(user_alerts) - 10} алертов"
+        if current_price:
+            response = f"🧪 ТЕКУЩАЯ ЦЕНА:\n\n{full_symbol}\n💰 ${current_price:,.2f}"
+            bot.send_message(message.chat.id, response)
         else:
-            response += "📭 У пользователя нет активных алертов"
-        
-        bot.send_message(message.chat.id, response)
-        
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ USER_ID должен быть числом!")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=['recent_users'])
-def recent_users(message):
-    """Недавно зарегистрированные пользователи (только для администратора)"""
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
-        return
-        
-    try:
-        # Парсим количество дней: /recent_users 7
-        parts = message.text.split()
-        days = 7  # по умолчанию за 7 дней
-        if len(parts) >= 2:
-            days = int(parts[1])
-        
-        conn = sqlite3.connect('alerts.db', check_same_thread=False)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        SELECT user_id, username, first_name, last_name, created_at, 
-               (SELECT COUNT(*) FROM alerts WHERE user_id = users.user_id) as alert_count
-        FROM users 
-        WHERE created_at > datetime("now", "-? days") 
-        ORDER BY created_at DESC
-        ''', (days,))
-        
-        recent_users = cursor.fetchall()
-        conn.close()
-        
-        if not recent_users:
-            bot.send_message(message.chat.id, f"📭 Нет новых пользователей за последние {days} дней")
-            return
-        
-        response = f"🆕 ПОЛЬЗОВАТЕЛИ ЗА ПОСЛЕДНИЕ {days} ДНЕЙ: {len(recent_users)}\n\n"
-        
-        for user in recent_users:
-            user_id, username, first_name, last_name, created_at, alert_count = user
+            bot.send_message(message.chat.id, "❌ Не удалось получить цену BTC")
             
-            user_info = f"👤 ID: {user_id}\n"
-            if username:
-                user_info += f"   @{username}\n"
-            if first_name:
-                user_info += f"   {first_name}"
-                if last_name:
-                    user_info += f" {last_name}"
-                user_info += "\n"
-            user_info += f"   📅 {created_at[:16]}\n"
-            user_info += f"   🔔 Алертов: {alert_count}\n"
-            user_info += "   ───────────────────\n"
-            
-            if len(response + user_info) > 4000:
-                bot.send_message(message.chat.id, response)
-                response = "🆕 ПРОДОЛЖЕНИЕ:\n\n" + user_info
-            else:
-                response += user_info
-        
-        bot.send_message(message.chat.id, response)
-        
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Количество дней должно быть числом!")
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
 
@@ -477,7 +394,7 @@ def list_alerts(message):
     alerts = get_user_alerts(user_id)
     
     if not alerts:
-        bot.send_message(message.chat.id, "📭 У тебя нет активных запросов.")
+        bot.send_message(message.chat.id, "У тебя нет активных запросов.")
     else:
         response = "📋 Твои активные запросы:\n\n"
         for alert in alerts:
@@ -494,7 +411,7 @@ def check_now(message):
         alerts = get_user_alerts(user_id)
         
         if not alerts:
-            bot.send_message(message.chat.id, "📭 У тебя нет активных алертов")
+            bot.send_message(message.chat.id, "У тебя нет активных алертов")
             return
             
         response = "🔍 Твои алерты:\n\n"
@@ -511,7 +428,7 @@ def check_now(message):
                 
                 response += f"• {icon} {symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} ({diff_text}) - {status}\n"
             else:
-                response += f"• {symbol}: ❌ ошибка получения цены\n"
+                response += f"• {symbol}: ошибка получения цены\n"
         
         bot.send_message(message.chat.id, response)
         
@@ -533,37 +450,29 @@ def clear_alerts(message):
 @bot.message_handler(func=lambda message: True)
 def set_alert(message):
     try:
-        # Пропускаем команды
-        if message.text.startswith('/'):
-            return
-            
         user_id = message.from_user.id
         text = message.text.split()
         
         if len(text) < 2:
-            bot.send_message(message.chat.id, "❌ Напиши в формате: ТИКЕР ЦЕНА\nПример: BTC 50000")
+            bot.send_message(message.chat.id, "❌ Напиши в формате: ТИКЕР ЦЕНА\nНапример: BTC 50000")
             return
 
         symbol = text[0].upper()
         target_price = float(text[1])
 
-        print(f"🔄 Запрос от {user_id}: {symbol} ${target_price}")
-
         current_price, full_symbol = get_current_price(symbol)
         
         if current_price is None:
-            bot.send_message(message.chat.id, f"❌ Тикер '{symbol}' не найден.")
+            bot.send_message(message.chat.id, f"❌ Тикер '{symbol}' не найден. Попробуй: BTC, ETH, SOL, ADA")
             return
 
         # Определяем тип алерта
         alert_type = determine_alert_type(current_price, target_price)
         alert_icon = "📈" if alert_type == "UP" else "📉"
 
-        add_alert(user_id, symbol, target_price, current_price, alert_type)
+        add_alert(user_id, full_symbol, target_price, current_price, alert_type)
         
-        response = f"""🎯 <b>Алерт установлен!</b>
-
-{symbol}
+        response = f"""{full_symbol}
 💰 Текущая цена: ${current_price:,.2f}
 {alert_icon} Оповещение при: <b>${target_price:,.2f}</b>"""
 
@@ -572,41 +481,97 @@ def set_alert(message):
     except ValueError:
         bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или ETH 3500.50")
     except Exception as e:
-        print(f"❌ Ошибка установки алерта: {e}")
         bot.send_message(message.chat.id, "❌ Ошибка, попробуй еще раз")
 
 # Фоновая проверка цен
 def check_prices():
-    print("🔄 Фоновая проверка цен ЗАПУЩЕНА! (интервал: 1 секунда)")
+    print("🔄 Фоновая проверка цен ЗАПУЩЕНА! (интервал: 10 секунд)")
+    
+    # Словарь для кэширования цен
+    price_cache = {}
+    cache_time = {}
+    CACHE_DURATION = 5  # секунды
     
     while True:
         try:
             alerts = get_active_alerts()
             
             if alerts:
+                # Логируем только если есть алерты
+                print(f"🔍 Проверяю {len(alerts)} активных алертов...")
+                
+                # Группируем алерты по символам
+                alerts_by_symbol = {}
+                symbols_to_check = set()
+                
                 for alert in alerts:
                     alert_id, user_id, symbol, target_price, alert_type = alert
+                    if symbol not in alerts_by_symbol:
+                        alerts_by_symbol[symbol] = []
+                    alerts_by_symbol[symbol].append(alert)
+                    symbols_to_check.add(symbol)
+                
+                # Получаем цены для символов (с кэшированием)
+                current_prices = {}
+                for symbol in symbols_to_check:
+                    # Проверяем кэш
+                    if symbol in price_cache and symbol in cache_time:
+                        if time.time() - cache_time[symbol] < CACHE_DURATION:
+                            current_prices[symbol] = price_cache[symbol]
+                            continue
                     
-                    current_price, _ = get_current_price(symbol)
+                    # Запрашиваем цену
+                    price, _ = get_current_price(symbol)
+                    if price:
+                        current_prices[symbol] = price
+                        price_cache[symbol] = price
+                        cache_time[symbol] = time.time()
+                    else:
+                        # Если не удалось получить цену, удаляем из кэша
+                        if symbol in price_cache:
+                            del price_cache[symbol]
+                        if symbol in cache_time:
+                            del cache_time[symbol]
+                
+                # Проверяем алерты
+                triggered_count = 0
+                for symbol, symbol_alerts in alerts_by_symbol.items():
+                    if symbol not in current_prices:
+                        continue
                     
-                    if current_price:
+                    current_price = current_prices[symbol]
+                    
+                    for alert in symbol_alerts:
+                        alert_id, user_id, symbol, target_price, alert_type = alert
+                        
                         if should_trigger_alert(current_price, target_price, alert_type):
-                            print(f"🚨 АЛЕРТ СРАБОТАЛ! {symbol} {alert_type} ${target_price}")
                             try:
                                 icon = "📈" if alert_type == "UP" else "📉"
                                 direction = "выросла до" if alert_type == "UP" else "упала до"
-                                message_text = f"🎯 <b>АЛЕРТ!</b>\n\n{icon} {symbol} {direction} ${target_price:,.2f}"
-                                bot.send_message(user_id, message_text, parse_mode='HTML')
+                                message_text = f"{icon} {symbol} {direction} ${target_price:,.2f}"
+                                bot.send_message(user_id, message_text)
                                 mark_alert_triggered(alert_id)
-                                print(f"✅ Уведомление отправлено пользователю {user_id}")
+                                triggered_count += 1
+                                
+                                # Удаляем из кэша
+                                if symbol in price_cache:
+                                    del price_cache[symbol]
+                                if symbol in cache_time:
+                                    del cache_time[symbol]
+                                    
                             except Exception as e:
-                                print(f"❌ Ошибка отправки: {e}")
+                                # Просто игнорируем ошибки отправки
+                                pass
+                
+                if triggered_count > 0:
+                    print(f"✅ Сработало {triggered_count} алертов")
             
-            time.sleep(1)
+            # Ждем 10 секунд между проверками
+            time.sleep(10)
                         
         except Exception as e:
             print(f"❌ Ошибка проверки: {e}")
-            time.sleep(2)
+            time.sleep(10)
 
 # Запуск
 if __name__ == "__main__":
@@ -622,6 +587,8 @@ if __name__ == "__main__":
     print("🤖 Бот начинает опрос Telegram...")
     
     try:
-        bot.infinity_polling(timeout=90, long_polling_timeout=90)
+        bot.polling(none_stop=True, interval=1, timeout=30)
     except Exception as e:
-        print(f"❌ Критическая ошибка: {e}")
+        print(f"❌ Ошибка бота: {e}")
+        time.sleep(5)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
