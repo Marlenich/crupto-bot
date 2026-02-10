@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import signal
+import atexit
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 
@@ -23,8 +24,10 @@ if not TELEGRAM_BOT_TOKEN:
 
 print(f"✅ Токен получен! Длина: {len(TELEGRAM_BOT_TOKEN)} символов")
 
-# Флаг для остановки потоков
+# Глобальные флаги и переменные
+bot_instance = None
 stop_threads = False
+polling_active = False
 
 # Создаем сессию requests с повторными попытками
 session = requests.Session()
@@ -37,13 +40,16 @@ adapter = HTTPAdapter(max_retries=retry)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
-# Создаем бота
-try:
-    bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode='HTML', threaded=True)
-    print("✅ Бот создан успешно!")
-except Exception as e:
-    print(f"❌ Ошибка создания бота: {e}")
-    exit()
+def create_bot():
+    """Создает новый экземпляр бота"""
+    global bot_instance
+    try:
+        bot_instance = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode='HTML', threaded=True)
+        print("✅ Бот создан успешно!")
+        return bot_instance
+    except Exception as e:
+        print(f"❌ Ошибка создания бота: {e}")
+        return None
 
 # База данных
 def init_db():
@@ -110,26 +116,11 @@ def get_active_alerts():
     conn.close()
     return all_alerts
 
-def get_all_alerts():
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute('SELECT id, user_id, symbol, target_price, current_price, alert_type FROM alerts')
-    all_alerts = cursor.fetchall()
-    conn.close()
-    return all_alerts
-
 def mark_alert_triggered(alert_id):
     """Помечаем алерт как сработавший"""
     conn = sqlite3.connect('alerts.db', check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('UPDATE alerts SET triggered = 1 WHERE id = ?', (alert_id,))
-    conn.commit()
-    conn.close()
-
-def delete_alert(alert_id):
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM alerts WHERE id = ?', (alert_id,))
     conn.commit()
     conn.close()
 
@@ -200,99 +191,102 @@ def is_admin(user_id):
     """Проверяет, является ли пользователь администратором"""
     return user_id == ADMIN_ID
 
-# Команды бота
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    first_name = message.from_user.first_name
-    last_name = message.from_user.last_name
+# Функции-обработчики команд (будут переопределены после создания бота)
+def setup_bot_handlers(bot):
+    """Настраивает обработчики команд для бота"""
     
-    # Логируем пользователя (в фоне, пользователь не видит)
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute('''
-    INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, created_at, last_activity) 
-    VALUES (?, ?, ?, ?, COALESCE((SELECT created_at FROM users WHERE user_id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
-    ''', (user_id, username, first_name, last_name, user_id))
-    conn.commit()
-    conn.close()
-    
-    bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипто монет на Bybit.\n\nПросто напиши: BTC 50000 (пример)\n\nЯ пришлю уведомление когда цена достигнет указанных значений")
-
-@bot.message_handler(commands=['status'])
-def status(message):
-    active_alerts = get_active_alerts()
-    alerts_count = len(active_alerts)
-    
-    bot.send_message(message.chat.id, f"✅ Бот работает!\nАктивных алертов: {alerts_count}\n\nИспользуй:\n/testprice - проверить цену\n/myalerts - мои алерты")
-
-@bot.message_handler(commands=['stats'])
-def show_stats(message):
-    """Статистика (только для администратора)"""
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
-        return
+    @bot.message_handler(commands=['start'])
+    def send_welcome(message):
+        user_id = message.from_user.id
+        username = message.from_user.username
+        first_name = message.from_user.first_name
+        last_name = message.from_user.last_name
         
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
-    cursor = conn.cursor()
+        # Логируем пользователя (в фоне, пользователь не видит)
+        conn = sqlite3.connect('alerts.db', check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute('''
+        INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, created_at, last_activity) 
+        VALUES (?, ?, ?, ?, COALESCE((SELECT created_at FROM users WHERE user_id = ?), CURRENT_TIMESTAMP), CURRENT_TIMESTAMP)
+        ''', (user_id, username, first_name, last_name, user_id))
+        conn.commit()
+        conn.close()
+        
+        bot.send_message(message.chat.id, "💰 Привет! Я бот для отслеживания цен крипто монет на Bybit.\n\nПросто напиши: BTC 50000 (пример)\n\nЯ пришлю уведомление когда цена достигнет указанных значений")
     
-    # Количество уникальных пользователей
-    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM alerts')
-    unique_users = cursor.fetchone()[0]
+    @bot.message_handler(commands=['status'])
+    def status(message):
+        active_alerts = get_active_alerts()
+        alerts_count = len(active_alerts)
+        
+        bot.send_message(message.chat.id, f"✅ Бот работает!\nАктивных алертов: {alerts_count}\n\nИспользуй:\n/testprice - проверить цену\n/myalerts - мои алерты")
     
-    # Общее количество алертов
-    cursor.execute('SELECT COUNT(*) FROM alerts')
-    total_alerts = cursor.fetchone()[0]
-    
-    # Активные алерты
-    cursor.execute('SELECT COUNT(*) FROM alerts WHERE triggered = 0')
-    active_alerts = cursor.fetchone()[0]
-    
-    conn.close()
-    
-    stats_text = f"""📊 СТАТИСТИКА БОТА:
+    @bot.message_handler(commands=['stats'])
+    def show_stats(message):
+        """Статистика (только для администратора)"""
+        if not is_admin(message.from_user.id):
+            bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
+            return
+            
+        conn = sqlite3.connect('alerts.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        # Количество уникальных пользователей
+        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM alerts')
+        unique_users = cursor.fetchone()[0]
+        
+        # Общее количество алертов
+        cursor.execute('SELECT COUNT(*) FROM alerts')
+        total_alerts = cursor.fetchone()[0]
+        
+        # Активные алерты
+        cursor.execute('SELECT COUNT(*) FROM alerts WHERE triggered = 0')
+        active_alerts = cursor.fetchone()[0]
+        
+        conn.close()
+        
+        stats_text = f"""📊 СТАТИСТИКА БОТА:
 
 👥 Всего пользователей: {unique_users}
 🔔 Всего алертов: {total_alerts}
 🎯 Активных алертов: {active_alerts}"""
 
-    bot.send_message(message.chat.id, stats_text)
-
-@bot.message_handler(commands=['detailed_stats'])
-def detailed_stats(message):
-    """Детальная статистика (только для администратора)"""
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
-        return
+        bot.send_message(message.chat.id, stats_text)
+    
+    @bot.message_handler(commands=['detailed_stats'])
+    def detailed_stats(message):
+        """Детальная статистика (только для администратора)"""
+        if not is_admin(message.from_user.id):
+            bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
+            return
+            
+        conn = sqlite3.connect('alerts.db', check_same_thread=False)
+        cursor = conn.cursor()
         
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    # Основная статистика
-    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users')
-    total_users = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(*) FROM alerts')
-    total_alerts = cursor.fetchone()[0]
-    
-    # Активные пользователи за разные периоды
-    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-1 day")')
-    active_1d = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-7 days")')
-    active_7d = cursor.fetchone()[0]
-    
-    cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-30 days")')
-    active_30d = cursor.fetchone()[0]
-    
-    # Популярные монеты
-    cursor.execute('SELECT symbol, COUNT(*) as count FROM alerts GROUP BY symbol ORDER BY count DESC LIMIT 5')
-    popular_coins = cursor.fetchall()
-    
-    conn.close()
-    
-    stats_text = f"""📊 ДЕТАЛЬНАЯ СТАТИСТИКА:
+        # Основная статистика
+        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users')
+        total_users = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(*) FROM alerts')
+        total_alerts = cursor.fetchone()[0]
+        
+        # Активные пользователи за разные периоды
+        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-1 day")')
+        active_1d = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-7 days")')
+        active_7d = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_activity > datetime("now", "-30 days")')
+        active_30d = cursor.fetchone()[0]
+        
+        # Популярные монеты
+        cursor.execute('SELECT symbol, COUNT(*) as count FROM alerts GROUP BY symbol ORDER BY count DESC LIMIT 5')
+        popular_coins = cursor.fetchall()
+        
+        conn.close()
+        
+        stats_text = f"""📊 ДЕТАЛЬНАЯ СТАТИСТИКА:
 
 👥 Всего пользователей: {total_users}
 🔔 Всего алертов: {total_alerts}
@@ -304,182 +298,182 @@ def detailed_stats(message):
 
 🏆 Популярные монеты:
 """
-    
-    for coin, count in popular_coins:
-        stats_text += f"• {coin}: {count} алертов\n"
-    
-    bot.send_message(message.chat.id, stats_text)
-
-@bot.message_handler(commands=['userlist'])
-def user_list(message):
-    """Список всех пользователей (только для администратора)"""
-    if not is_admin(message.from_user.id):
-        bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
-        return
         
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
-    cursor = conn.cursor()
-    
-    # Получаем всех пользователей с количеством их алертов
-    cursor.execute('''
-    SELECT u.user_id, u.username, u.first_name, u.last_name, u.created_at, u.last_activity, 
-           COUNT(a.id) as alert_count
-    FROM users u 
-    LEFT JOIN alerts a ON u.user_id = a.user_id 
-    GROUP BY u.user_id 
-    ORDER BY u.created_at DESC
-    ''')
-    users = cursor.fetchall()
-    
-    conn.close()
-    
-    if not users:
-        bot.send_message(message.chat.id, "📭 В базе нет пользователей")
-        return
-    
-    # Разбиваем на части, если пользователей много
-    user_count = len(users)
-    response = f"👥 ВСЕ ПОЛЬЗОВАТЕЛИ: {user_count}\n\n"
-    
-    for i, user in enumerate(users, 1):
-        user_id, username, first_name, last_name, created_at, last_activity, alert_count = user
+        for coin, count in popular_coins:
+            stats_text += f"• {coin}: {count} алертов\n"
         
-        # Форматируем даты
-        created = created_at[:16] if created_at else "неизвестно"
-        last_active = last_activity[:16] if last_activity else "неизвестно"
-        
-        user_info = f"#{i} 👤 ID: {user_id}\n"
-        if username:
-            user_info += f"   @{username}\n"
-        if first_name:
-            user_info += f"   Имя: {first_name}"
-            if last_name:
-                user_info += f" {last_name}"
-            user_info += "\n"
-        user_info += f"   📅 Регистрация: {created}\n"
-        user_info += f"   ⏰ Последняя активность: {last_active}\n"
-        user_info += f"   🔔 Алертов: {alert_count}\n"
-        user_info += "   ───────────────────\n"
-        
-        # Если сообщение становится слишком длинным, отправляем и начинаем новое
-        if len(response + user_info) > 4000:
-            bot.send_message(message.chat.id, response)
-            response = "👥 ПРОДОЛЖЕНИЕ:\n\n" + user_info
-        else:
-            response += user_info
+        bot.send_message(message.chat.id, stats_text)
     
-    bot.send_message(message.chat.id, response)
-
-@bot.message_handler(commands=['testprice'])
-def test_price(message):
-    """Проверка текущей цены"""
-    try:
-        symbol = "BTC"
-        current_price, full_symbol = get_current_price(symbol)
-        
-        if current_price:
-            response = f"🧪 ТЕКУЩАЯ ЦЕНА:\n\n{full_symbol}\n💰 ${current_price:,.2f}"
-            bot.send_message(message.chat.id, response)
-        else:
-            bot.send_message(message.chat.id, "❌ Не удалось получить цену BTC")
+    @bot.message_handler(commands=['userlist'])
+    def user_list(message):
+        """Список всех пользователей (только для администратора)"""
+        if not is_admin(message.from_user.id):
+            bot.send_message(message.chat.id, "❌ У вас нет доступа к этой команде")
+            return
             
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
-
-@bot.message_handler(commands=['myalerts'])
-def list_alerts(message):
-    user_id = message.from_user.id
-    alerts = get_user_alerts(user_id)
-    
-    if not alerts:
-        bot.send_message(message.chat.id, "У тебя нет активных запросов.")
-    else:
-        response = "📋 Твои активные запросы:\n\n"
-        for alert in alerts:
-            id, symbol, target_price, alert_type = alert
-            icon = "📈" if alert_type == "UP" else "📉"
-            response += f"• {icon} {symbol} -> ${target_price:,.2f} ({alert_type})\n"
+        conn = sqlite3.connect('alerts.db', check_same_thread=False)
+        cursor = conn.cursor()
+        
+        # Получаем всех пользователей с количеством их алертов
+        cursor.execute('''
+        SELECT u.user_id, u.username, u.first_name, u.last_name, u.created_at, u.last_activity, 
+               COUNT(a.id) as alert_count
+        FROM users u 
+        LEFT JOIN alerts a ON u.user_id = a.user_id 
+        GROUP BY u.user_id 
+        ORDER BY u.created_at DESC
+        ''')
+        users = cursor.fetchall()
+        
+        conn.close()
+        
+        if not users:
+            bot.send_message(message.chat.id, "📭 В базе нет пользователей")
+            return
+        
+        # Разбиваем на части, если пользователей много
+        user_count = len(users)
+        response = f"👥 ВСЕ ПОЛЬЗОВАТЕЛИ: {user_count}\n\n"
+        
+        for i, user in enumerate(users, 1):
+            user_id, username, first_name, last_name, created_at, last_activity, alert_count = user
+            
+            # Форматируем даты
+            created = created_at[:16] if created_at else "неизвестно"
+            last_active = last_activity[:16] if last_activity else "неизвестно"
+            
+            user_info = f"#{i} 👤 ID: {user_id}\n"
+            if username:
+                user_info += f"   @{username}\n"
+            if first_name:
+                user_info += f"   Имя: {first_name}"
+                if last_name:
+                    user_info += f" {last_name}"
+                user_info += "\n"
+            user_info += f"   📅 Регистрация: {created}\n"
+            user_info += f"   ⏰ Последняя активность: {last_active}\n"
+            user_info += f"   🔔 Алертов: {alert_count}\n"
+            user_info += "   ───────────────────\n"
+            
+            # Если сообщение становится слишком длинным, отправляем и начинаем новое
+            if len(response + user_info) > 4000:
+                bot.send_message(message.chat.id, response)
+                response = "👥 ПРОДОЛЖЕНИЕ:\n\n" + user_info
+            else:
+                response += user_info
+        
         bot.send_message(message.chat.id, response)
-
-@bot.message_handler(commands=['checknow'])
-def check_now(message):
-    """Принудительная проверка всех алертов"""
-    user_id = message.from_user.id
-    try:
+    
+    @bot.message_handler(commands=['testprice'])
+    def test_price(message):
+        """Проверка текущей цены"""
+        try:
+            symbol = "BTC"
+            current_price, full_symbol = get_current_price(symbol)
+            
+            if current_price:
+                response = f"🧪 ТЕКУЩАЯ ЦЕНА:\n\n{full_symbol}\n💰 ${current_price:,.2f}"
+                bot.send_message(message.chat.id, response)
+            else:
+                bot.send_message(message.chat.id, "❌ Не удалось получить цену BTC")
+                
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+    
+    @bot.message_handler(commands=['myalerts'])
+    def list_alerts(message):
+        user_id = message.from_user.id
         alerts = get_user_alerts(user_id)
         
         if not alerts:
-            bot.send_message(message.chat.id, "У тебя нет активных алертов")
-            return
-            
-        response = "🔍 Твои алерты:\n\n"
-        for alert in alerts:
-            id, symbol, target_price, alert_type = alert
-            current_price_now, _ = get_current_price(symbol)
-            
-            if current_price_now:
+            bot.send_message(message.chat.id, "У тебя нет активных запросов.")
+        else:
+            response = "📋 Твои активные запросы:\n\n"
+            for alert in alerts:
+                id, symbol, target_price, alert_type = alert
                 icon = "📈" if alert_type == "UP" else "📉"
-                status = "✅ ГОТОВ!" if should_trigger_alert(current_price_now, target_price, alert_type) else "⏳ жду"
-                diff = current_price_now - target_price
-                diff_percent = (diff / target_price) * 100
-                diff_text = f"+{diff_percent:.2f}%" if diff > 0 else f"{diff_percent:.2f}%"
-                
-                response += f"• {icon} {symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} ({diff_text}) - {status}\n"
-            else:
-                response += f"• {symbol}: ошибка получения цены\n"
-        
-        bot.send_message(message.chat.id, response)
-        
-    except Exception as e:
-        bot.send_message(message.chat.id, f"❌ Ошибка проверки: {e}")
-
-@bot.message_handler(commands=['clear'])
-def clear_alerts(message):
-    user_id = message.from_user.id
-    conn = sqlite3.connect('alerts.db', check_same_thread=False)
-    cursor = conn.cursor()
-    cursor.execute('DELETE FROM alerts WHERE user_id = ?', (user_id,))
-    count = cursor.rowcount
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, f"✅ Удалено {count} алертов!")
-
-# Установка алерта
-@bot.message_handler(func=lambda message: True)
-def set_alert(message):
-    try:
+                response += f"• {icon} {symbol} -> ${target_price:,.2f} ({alert_type})\n"
+            bot.send_message(message.chat.id, response)
+    
+    @bot.message_handler(commands=['checknow'])
+    def check_now(message):
+        """Принудительная проверка всех алертов"""
         user_id = message.from_user.id
-        text = message.text.split()
-        
-        if len(text) < 2:
-            bot.send_message(message.chat.id, "❌ Напиши в формате: ТИКЕР ЦЕНА\nНапример: BTC 50000")
-            return
+        try:
+            alerts = get_user_alerts(user_id)
+            
+            if not alerts:
+                bot.send_message(message.chat.id, "У тебя нет активных алертов")
+                return
+                
+            response = "🔍 Твои алерты:\n\n"
+            for alert in alerts:
+                id, symbol, target_price, alert_type = alert
+                current_price_now, _ = get_current_price(symbol)
+                
+                if current_price_now:
+                    icon = "📈" if alert_type == "UP" else "📉"
+                    status = "✅ ГОТОВ!" if should_trigger_alert(current_price_now, target_price, alert_type) else "⏳ жду"
+                    diff = current_price_now - target_price
+                    diff_percent = (diff / target_price) * 100
+                    diff_text = f"+{diff_percent:.2f}%" if diff > 0 else f"{diff_percent:.2f}%"
+                    
+                    response += f"• {icon} {symbol}: ${current_price_now:,.2f} / ${target_price:,.2f} ({diff_text}) - {status}\n"
+                else:
+                    response += f"• {symbol}: ошибка получения цены\n"
+            
+            bot.send_message(message.chat.id, response)
+            
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Ошибка проверки: {e}")
+    
+    @bot.message_handler(commands=['clear'])
+    def clear_alerts(message):
+        user_id = message.from_user.id
+        conn = sqlite3.connect('alerts.db', check_same_thread=False)
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM alerts WHERE user_id = ?', (user_id,))
+        count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        bot.send_message(message.chat.id, f"✅ Удалено {count} алертов!")
+    
+    # Установка алерта
+    @bot.message_handler(func=lambda message: True)
+    def set_alert(message):
+        try:
+            user_id = message.from_user.id
+            text = message.text.split()
+            
+            if len(text) < 2:
+                bot.send_message(message.chat.id, "❌ Напиши в формате: ТИКЕР ЦЕНА\nНапример: BTC 50000")
+                return
 
-        symbol = text[0].upper()
-        target_price = float(text[1])
+            symbol = text[0].upper()
+            target_price = float(text[1])
 
-        current_price, full_symbol = get_current_price(symbol)
-        
-        if current_price is None:
-            bot.send_message(message.chat.id, f"❌ Тикер '{symbol}' не найден. Попробуй: BTC, ETH, SOL, ADA")
-            return
+            current_price, full_symbol = get_current_price(symbol)
+            
+            if current_price is None:
+                bot.send_message(message.chat.id, f"❌ Тикер '{symbol}' не найден. Попробуй: BTC, ETH, SOL, ADA")
+                return
 
-        # Определяем тип алерта
-        alert_type = determine_alert_type(current_price, target_price)
-        alert_icon = "📈" if alert_type == "UP" else "📉"
+            # Определяем тип алерта
+            alert_type = determine_alert_type(current_price, target_price)
+            alert_icon = "📈" if alert_type == "UP" else "📉"
 
-        add_alert(user_id, full_symbol, target_price, current_price, alert_type)
-        
-        response = f"""{full_symbol}
+            add_alert(user_id, full_symbol, target_price, current_price, alert_type)
+            
+            response = f"""{full_symbol}
 💰 Текущая цена: ${current_price:,.2f}
 {alert_icon} Оповещение при: <b>${target_price:,.2f}</b>"""
 
-        bot.send_message(message.chat.id, response, parse_mode='HTML')
-        
-    except ValueError:
-        bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или ETH 3500.50")
-    except Exception as e:
-        bot.send_message(message.chat.id, "❌ Ошибка, попробуй еще раз")
+            bot.send_message(message.chat.id, response, parse_mode='HTML')
+            
+        except ValueError:
+            bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или ETH 3500.50")
+        except Exception as e:
+            bot.send_message(message.chat.id, "❌ Ошибка, попробуй еще раз")
 
 # Фоновая проверка цен
 def check_prices():
@@ -543,7 +537,12 @@ def check_prices():
                                 icon = "📈" if alert_type == "UP" else "📉"
                                 direction = "выросла до" if alert_type == "UP" else "упала до"
                                 message_text = f"{icon} {symbol} {direction} ${target_price:,.2f}"
-                                bot.send_message(user_id, message_text)
+                                
+                                # Используем глобальный экземпляр бота для отправки
+                                global bot_instance
+                                if bot_instance:
+                                    bot_instance.send_message(user_id, message_text)
+                                
                                 mark_alert_triggered(alert_id)
                                 
                                 # Удаляем из кэша
@@ -562,19 +561,30 @@ def check_prices():
         except Exception:
             time.sleep(5)
 
+def stop_bot():
+    """Останавливает бота и все потоки"""
+    global stop_threads, polling_active
+    print("🛑 Остановка бота...")
+    stop_threads = True
+    
+    # Даем время потокам завершиться
+    time.sleep(2)
+    
+    # Закрываем сессию requests
+    global session
+    session.close()
+    
+    print("✅ Бот остановлен")
+
 def signal_handler(signum, frame):
     """Обработчик сигналов для graceful shutdown"""
-    global stop_threads
-    print("\n🛑 Получен сигнал остановки...")
-    stop_threads = True
-    time.sleep(1)
+    print(f"\n🛑 Получен сигнал {signum}. Останавливаю бота...")
+    stop_bot()
     sys.exit(0)
 
-# Запуск
-if __name__ == "__main__":
-    # Регистрируем обработчик сигналов
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+def run_bot():
+    """Основная функция запуска бота"""
+    global stop_threads, polling_active, bot_instance
     
     print("🔄 Инициализация...")
     init_db()
@@ -585,24 +595,75 @@ if __name__ == "__main__":
     price_thread.start()
     
     print("✅ ВСЕ СИСТЕМЫ ЗАПУЩЕНЫ")
-    print("🤖 Бот начинает опрос Telegram...")
     
-    # Главный цикл работы бота с перезапуском при ошибках
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Регистрируем функцию остановки при выходе
+    atexit.register(stop_bot)
+    
+    # Основной цикл работы бота
     while not stop_threads:
         try:
-            print("🔄 Запуск polling...")
-            bot.polling(none_stop=False, interval=1, timeout=30)
-        except telebot.apihelper.ApiTelegramException as e:
-            if "terminated by other getUpdates request" in str(e):
-                print("⚠️ Обнаружено несколько экземпляров бота. Жду 10 секунд...")
+            print("🤖 Создаю новый экземпляр бота...")
+            bot_instance = create_bot()
+            
+            if not bot_instance:
+                print("❌ Не удалось создать бота. Жду 10 секунд...")
                 time.sleep(10)
+                continue
+            
+            # Настраиваем обработчики
+            print("🔄 Настраиваю обработчики команд...")
+            setup_bot_handlers(bot_instance)
+            
+            print("🤖 Бот начинает опрос Telegram...")
+            
+            # Очищаем webhook на всякий случай
+            bot_instance.remove_webhook()
+            time.sleep(1)
+            
+            # Запускаем polling с коротким таймаутом
+            polling_active = True
+            bot_instance.polling(none_stop=True, interval=1, timeout=20)
+            
+        except telebot.apihelper.ApiTelegramException as e:
+            polling_active = False
+            
+            if "Conflict: terminated by other getUpdates request" in str(e):
+                print("⚠️ Ошибка 409: Обнаружен другой запущенный экземпляр бота")
+                print("🔄 Жду 30 секунд и создаю нового бота...")
+                
+                # Останавливаем текущий экземпляр
+                try:
+                    bot_instance.stop_polling()
+                except:
+                    pass
+                
+                # Даем время старому экземпляру завершиться
+                time.sleep(30)
+                
+                # Создаем нового бота
+                continue
+                
             else:
                 print(f"❌ Ошибка Telegram API: {e}")
-                time.sleep(5)
+                print("🔄 Перезапуск через 10 секунд...")
+                time.sleep(10)
+                
         except Exception as e:
-            print(f"❌ Общая ошибка: {e}")
-            time.sleep(5)
+            polling_active = False
+            print(f"❌ Критическая ошибка: {e}")
+            print("🔄 Перезапуск через 10 секунд...")
+            time.sleep(10)
+            
         finally:
+            polling_active = False
             if not stop_threads:
                 print("🔄 Перезапуск бота через 5 секунд...")
                 time.sleep(5)
+
+# Запуск
+if __name__ == "__main__":
+    run_bot()
