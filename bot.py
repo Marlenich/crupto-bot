@@ -75,6 +75,17 @@ adapter = HTTPAdapter(max_retries=retry)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
+def format_price(price):
+    """
+    Форматирует цену в зависимости от её величины:
+    - Если цена >= 1: два знака после запятой (пример: $65,789.23)
+    - Если цена < 1: восемь знаков после запятой (пример: $0.00123456)
+    """
+    if price >= 1:
+        return f"${price:,.2f}"
+    else:
+        return f"${price:,.8f}"
+
 def create_bot():
     """Создает новый экземпляр бота"""
     global bot_instance
@@ -357,7 +368,7 @@ def setup_bot_handlers(bot):
         # Проверяем текущую цену BTC для демонстрации
         btc_price, btc_symbol = get_current_price("BTC")
         if btc_price:
-            price_info = f"\n💰 {btc_symbol}: ${btc_price:,.6f}"
+            price_info = f"\n💰 {btc_symbol}: {format_price(btc_price)}"
         else:
             price_info = "\n⚠️ Не удалось получить цену BTC"
         
@@ -389,7 +400,7 @@ def setup_bot_handlers(bot):
             price, found_symbol = get_current_price(symbol)
             
             if price:
-                bot.send_message(message.chat.id, f"✅ Монета найдена!\n\n📈 Символ: {found_symbol}\n💰 Цена: ${price:,.6f}\n\nТеперь можешь установить алерт:\n{symbol} {price * 1.1:.6f}")
+                bot.send_message(message.chat.id, f"✅ Монета найдена!\n\n📈 Символ: {found_symbol}\n💰 Цена: {format_price(price)}\n\nТеперь можешь установить алерт:\n{symbol} {(price * 1.1):.8f}")
             else:
                 bot.send_message(message.chat.id, f"❌ Монета '{symbol}' не найдена на Bybit.\n\nПопробуй:\n• Проверить правильность написания\n• Убедиться, что монета торгуется на Bybit\n• Попробовать другой тикер")
                 
@@ -410,10 +421,10 @@ def setup_bot_handlers(bot):
                 response = f"""🧪 ТЕКУЩИЕ ЦЕНЫ:
 
 {full_symbol}
-💰 ${current_price:,.6f}"""
+💰 {format_price(current_price)}"""
                 
                 if eth_price:
-                    response += f"\n\n{eth_symbol}\n💰 ${eth_price:,.6f}"
+                    response += f"\n\n{eth_symbol}\n💰 {format_price(eth_price)}"
                 
                 bot.send_message(message.chat.id, response)
             else:
@@ -434,7 +445,7 @@ def setup_bot_handlers(bot):
             for alert in alerts:
                 id, symbol, target_price, alert_type = alert
                 icon = "📈" if alert_type == "UP" else "📉"
-                response += f"• {icon} {symbol} -> ${target_price:,.6f}\n"
+                response += f"• {icon} {symbol} -> {format_price(target_price)}\n"
             bot.send_message(message.chat.id, response)
     
     @bot.message_handler(commands=['checknow'])
@@ -468,12 +479,12 @@ def setup_bot_handlers(bot):
                     diff_percent = (diff / target_price) * 100
                     diff_text = f"+{diff_percent:.2f}%" if diff > 0 else f"{diff_percent:.2f}%"
                     
-                    response += f"• {icon} {full_symbol}: ${current_price_now:,.6f} / ${target_price:,.6f} ({diff_text}) - {status}\n"
+                    response += f"• {icon} {full_symbol}: {format_price(current_price_now)} / {format_price(target_price)} ({diff_text}) - {status}\n"
                 else:
                     response += f"• {symbol}: ❌ ошибка получения цены\n"
             
             if triggered_count > 0:
-                response += f"\n🎯 Готово к отправку: {triggered_count} алертов"
+                response += f"\n🎯 Готово к отправке: {triggered_count} алертов"
             
             bot.send_message(message.chat.id, response)
             
@@ -514,7 +525,7 @@ def setup_bot_handlers(bot):
             try:
                 target_price = float(text[1].replace('$', '').replace(',', ''))
             except ValueError:
-                bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или MYX 0.123456")
+                bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или MYX 0.12345678")
                 return
 
             # Проверяем валидность цены
@@ -552,14 +563,14 @@ def setup_bot_handlers(bot):
             response = f"""✅ АЛЕРТ УСТАНОВЛЕН!
 
 {full_symbol}
-💰 Текущая цена: ${current_price:,.6f}
-{alert_icon} Оповещение при: <b>${target_price:,.6f}</b>
+💰 Текущая цена: {format_price(current_price)}
+{alert_icon} Оповещение при: <b>{format_price(target_price)}</b>
 🎯 Направление: цена {direction}"""
 
             bot.send_message(message.chat.id, response, parse_mode='HTML')
             
         except ValueError:
-            bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или MYX 0.123456")
+            bot.send_message(message.chat.id, "❌ Цена должна быть числом!\nПример: BTC 50000 или MYX 0.12345678")
         except Exception as e:
             error_msg = str(e)[:100]
             bot.send_message(message.chat.id, f"❌ Ошибка: {error_msg}\nПопробуй еще раз")
@@ -634,7 +645,8 @@ def check_prices():
                                 icon = "📈" if alert_type == "UP" else "📉"
                                 direction = "выросла до" if alert_type == "UP" else "упала до"
                                 
-                                message_text = f"{icon} {symbol} {direction} ${target_price:,.6f}"
+                                # Форматируем цену в зависимости от её величины
+                                message_text = f"{icon} {symbol} {direction} {format_price(target_price)}"
                                 
                                 # Используем глобальный экземпляр бота для отправки
                                 global bot_instance
