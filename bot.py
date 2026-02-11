@@ -23,8 +23,8 @@ print("=== БОТ ЗАПУЩЕН НА RAILWAY ===")
 # Токен бота
 TELEGRAM_BOT_TOKEN = '7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU'
 
-# ID администратора (ЗАМЕНИ НА СВОЙ ID)
-ADMIN_ID = 5870642170  # ← ТВОЙ TELEGRAM ID
+# ID администратора (ТВОЙ ID)
+ADMIN_ID = 5870642170
 
 # === ПОДКЛЮЧЕНИЕ К POSTGRESQL ===
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -40,12 +40,12 @@ def get_db_connection():
     conn.autocommit = False
     return conn
 
-# === ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ (ЕСЛИ ЕЩЁ НЕ СОЗДАНЫ) ===
+# === МИГРАЦИИ БАЗЫ ДАННЫХ (БЕЗ ПОТЕРИ ДАННЫХ) ===
 def init_db():
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # Таблица пользователей (users)
+    # ----- Таблица users -----
     cur.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id BIGINT PRIMARY KEY,
@@ -57,31 +57,93 @@ def init_db():
         )
     ''')
     
-    # Таблица алертов (alerts)
+    # ----- Таблица alerts -----
     cur.execute('''
         CREATE TABLE IF NOT EXISTS alerts (
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
             symbol TEXT NOT NULL,
             target_price NUMERIC NOT NULL,
-            current_price NUMERIC NOT NULL,
-            alert_type TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW(),
-            triggered INTEGER DEFAULT 0
+            current_price NUMERIC,
+            alert_type TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
     
-    # Индексы для ускорения
-    cur.execute('CREATE INDEX IF NOT EXISTS idx_alerts_user_id ON alerts(user_id)')
-    cur.execute('CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol)')
-    cur.execute('CREATE INDEX IF NOT EXISTS idx_alerts_triggered ON alerts(triggered)')
+    # === МИГРАЦИИ: ДОБАВЛЯЕМ НЕДОСТАЮЩИЕ КОЛОНКИ ===
+    
+    # 1. Колонка triggered (DEFAULT 0)
+    try:
+        cur.execute('ALTER TABLE alerts ADD COLUMN triggered INTEGER DEFAULT 0')
+        print("✅ Миграция: добавлена колонка triggered в alerts")
+    except psycopg2.errors.DuplicateColumn:
+        # Колонка уже существует — игнорируем
+        pass
+    except Exception as e:
+        print(f"⚠️ Ошибка при добавлении triggered: {e}")
+    
+    # 2. Колонка current_price (если вдруг NULL)
+    try:
+        cur.execute('ALTER TABLE alerts ALTER COLUMN current_price SET NOT NULL')
+    except Exception:
+        # Если не получается, пробуем установить значение по умолчанию
+        try:
+            cur.execute('UPDATE alerts SET current_price = 0 WHERE current_price IS NULL')
+            cur.execute('ALTER TABLE alerts ALTER COLUMN current_price SET NOT NULL')
+        except:
+            pass
+    
+    # 3. Колонка alert_type (если вдруг NULL)
+    try:
+        cur.execute('ALTER TABLE alerts ALTER COLUMN alert_type SET NOT NULL')
+    except Exception:
+        try:
+            cur.execute("UPDATE alerts SET alert_type = 'UP' WHERE alert_type IS NULL")
+            cur.execute('ALTER TABLE alerts ALTER COLUMN alert_type SET NOT NULL')
+        except:
+            pass
+    
+    # 4. Внешний ключ (если не задан) — опционально
+    try:
+        cur.execute('''
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint WHERE conname = 'alerts_user_id_fkey'
+                ) THEN
+                    ALTER TABLE alerts ADD CONSTRAINT alerts_user_id_fkey 
+                        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE;
+                END IF;
+            END $$;
+        ''')
+    except Exception as e:
+        print(f"⚠️ Не удалось добавить внешний ключ: {e}")
+    
+    # === ИНДЕКСЫ (ТОЛЬКО ЕСЛИ КОЛОНКИ СУЩЕСТВУЮТ) ===
+    try:
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_alerts_user_id ON alerts(user_id)')
+    except Exception as e:
+        print(f"⚠️ Ошибка индекса user_id: {e}")
+    
+    try:
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol)')
+    except Exception as e:
+        print(f"⚠️ Ошибка индекса symbol: {e}")
+    
+    # Индекс на triggered — только если колонка существует
+    try:
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_alerts_triggered ON alerts(triggered)')
+    except psycopg2.errors.UndefinedColumn:
+        print("⚠️ Колонка triggered ещё не создана, индекс пропущен")
+    except Exception as e:
+        print(f"⚠️ Ошибка индекса triggered: {e}")
     
     conn.commit()
     cur.close()
     conn.close()
-    print("✅ PostgreSQL: таблицы проверены/созданы")
+    print("✅ PostgreSQL: миграции завершены, таблицы готовы")
 
-# === ФАЙЛОВАЯ БЛОКИРОВКА (ОДИН ЭКЗЕМПЛЯР) ===
+# === ФАЙЛОВАЯ БЛОКИРОВКА ===
 LOCK_FILE = '/tmp/bot.lock'
 
 def acquire_lock():
@@ -121,7 +183,6 @@ session.mount('http://', adapter)
 session.mount('https://', adapter)
 
 def format_price(price):
-    """Динамическое форматирование цены"""
     if price >= 1:
         return f"${price:,.2f}"
     else:
@@ -137,22 +198,20 @@ def create_bot():
         print(f"❌ Ошибка создания бота: {e}")
         return None
 
-# === РАБОТА С POSTGRESQL (ФУНКЦИИ БИЗНЕС-ЛОГИКИ) ===
+# === РАБОТА С POSTGRESQL ===
 def add_alert(user_id, symbol, target_price, current_price, alert_type):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Обновляем/добавляем пользователя
         cur.execute('''
             INSERT INTO users (user_id, last_activity) 
             VALUES (%s, NOW())
             ON CONFLICT (user_id) DO UPDATE SET last_activity = NOW()
         ''', (user_id,))
         
-        # Добавляем алерт
         cur.execute('''
-            INSERT INTO alerts (user_id, symbol, target_price, current_price, alert_type) 
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO alerts (user_id, symbol, target_price, current_price, alert_type, triggered) 
+            VALUES (%s, %s, %s, %s, %s, 0)
         ''', (user_id, symbol.upper(), target_price, current_price, alert_type))
         
         conn.commit()
@@ -166,43 +225,65 @@ def add_alert(user_id, symbol, target_price, current_price, alert_type):
         conn.close()
 
 def get_active_alerts():
-    """Получаем не сработавшие алерты (triggered = 0)"""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute('''
-        SELECT id, user_id, symbol, target_price, alert_type 
-        FROM alerts 
-        WHERE triggered = 0
-    ''')
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    try:
+        cur.execute('''
+            SELECT id, user_id, symbol, target_price, alert_type 
+            FROM alerts 
+            WHERE triggered = 0
+        ''')
+        rows = cur.fetchall()
+    except psycopg2.errors.UndefinedColumn:
+        # Если колонки triggered нет, считаем все алерты активными (временно)
+        cur.execute('''
+            SELECT id, user_id, symbol, target_price, alert_type 
+            FROM alerts
+        ''')
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
     return [(row['id'], row['user_id'], row['symbol'], float(row['target_price']), row['alert_type']) for row in rows]
 
 def mark_alert_triggered(alert_id):
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute('UPDATE alerts SET triggered = 1 WHERE id = %s', (alert_id,))
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur.execute('UPDATE alerts SET triggered = 1 WHERE id = %s', (alert_id,))
+        conn.commit()
+    except Exception as e:
+        print(f"⚠️ Не удалось пометить алтер {alert_id} как сработавший: {e}")
+        conn.rollback()
+    finally:
+        cur.close()
+        conn.close()
 
 def get_user_alerts(user_id):
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-    cur.execute('''
-        SELECT id, symbol, target_price, alert_type 
-        FROM alerts 
-        WHERE user_id = %s AND triggered = 0
-        ORDER BY created_at DESC
-    ''', (user_id,))
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
+    try:
+        cur.execute('''
+            SELECT id, symbol, target_price, alert_type 
+            FROM alerts 
+            WHERE user_id = %s AND triggered = 0
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        rows = cur.fetchall()
+    except psycopg2.errors.UndefinedColumn:
+        cur.execute('''
+            SELECT id, symbol, target_price, alert_type 
+            FROM alerts 
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        rows = cur.fetchall()
+    finally:
+        cur.close()
+        conn.close()
     return [(row['id'], row['symbol'], float(row['target_price']), row['alert_type']) for row in rows]
 
 def get_all_alerts():
-    """Для статистики — все алерты"""
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     cur.execute('SELECT id, user_id, symbol, target_price, current_price, alert_type FROM alerts')
@@ -242,7 +323,7 @@ def get_current_price(symbol):
                             return float(ticker['indexPrice']), sym
             except:
                 continue
-        # Поиск по всем тикерам, если точный не найден
+        # Поиск по всем тикерам
         try:
             url = "https://api.bybit.com/v5/market/tickers?category=spot"
             response = session.get(url, timeout=10)
@@ -273,7 +354,7 @@ def should_trigger_alert(current_price, target_price, alert_type):
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
-# === ОБРАБОТЧИКИ КОМАНД TELEGRAM ===
+# === ОБРАБОТЧИКИ КОМАНД ===
 def setup_bot_handlers(bot):
     
     @bot.message_handler(commands=['start'])
@@ -454,7 +535,7 @@ def setup_bot_handlers(bot):
         else:
             bot.send_message(message.chat.id, "📭 У тебя не было активных алертов")
     
-    # === АДМИНИСТРАТОРСКИЕ КОМАНДЫ ===
+    # === АДМИН-КОМАНДЫ ===
     @bot.message_handler(commands=['stats'])
     def show_stats(message):
         if not is_admin(message.from_user.id):
@@ -466,8 +547,11 @@ def setup_bot_handlers(bot):
         unique_users = cur.fetchone()[0]
         cur.execute('SELECT COUNT(*) FROM alerts')
         total_alerts = cur.fetchone()[0]
-        cur.execute('SELECT COUNT(*) FROM alerts WHERE triggered = 0')
-        active_alerts = cur.fetchone()[0]
+        try:
+            cur.execute('SELECT COUNT(*) FROM alerts WHERE triggered = 0')
+            active_alerts = cur.fetchone()[0]
+        except psycopg2.errors.UndefinedColumn:
+            active_alerts = total_alerts  # fallback
         cur.close()
         conn.close()
         stats_text = f"""📊 СТАТИСТИКА БОТА:
@@ -692,8 +776,11 @@ def setup_bot_handlers(bot):
         users_count = cur.fetchone()[0]
         cur.execute("SELECT COUNT(*) FROM alerts")
         alerts_count = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM alerts WHERE triggered = 0")
-        active_count = cur.fetchone()[0]
+        try:
+            cur.execute("SELECT COUNT(*) FROM alerts WHERE triggered = 0")
+            active_count = cur.fetchone()[0]
+        except psycopg2.errors.UndefinedColumn:
+            active_count = alerts_count
         cur.close()
         conn.close()
         info = f"""📁 **ИНФОРМАЦИЯ О БАЗЕ ДАННЫХ**
@@ -704,7 +791,7 @@ def setup_bot_handlers(bot):
 Активных алертов: {active_count}"""
         bot.send_message(message.chat.id, info, parse_mode='Markdown')
     
-    # === УСТАНОВКА АЛЕРТА (ОСНОВНАЯ ФУНКЦИЯ) ===
+    # === УСТАНОВКА АЛЕРТА ===
     @bot.message_handler(func=lambda message: True)
     def set_alert(message):
         if message.text.startswith('/'):
@@ -867,7 +954,7 @@ def run_bot():
             print("🤖 Бот начинает опрос Telegram...")
             bot_instance.remove_webhook()
             time.sleep(1)
-            time.sleep(2)  # Задержка для избежания 409
+            time.sleep(2)
             polling_active = True
             bot_instance.polling(
                 none_stop=True,
@@ -880,7 +967,6 @@ def run_bot():
         except telebot.apihelper.ApiTelegramException as e:
             polling_active = False
             if "Conflict: terminated by other getUpdates request" in str(e):
-                # Полностью игнорируем, без лога
                 time.sleep(5)
                 continue
             else:
