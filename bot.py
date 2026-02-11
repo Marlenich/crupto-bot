@@ -77,7 +77,6 @@ def init_db():
         cur.execute('ALTER TABLE alerts ADD COLUMN triggered INTEGER DEFAULT 0')
         print("✅ Миграция: добавлена колонка triggered в alerts")
     except psycopg2.errors.DuplicateColumn:
-        # Колонка уже существует — игнорируем
         pass
     except Exception as e:
         print(f"⚠️ Ошибка при добавлении triggered: {e}")
@@ -86,7 +85,6 @@ def init_db():
     try:
         cur.execute('ALTER TABLE alerts ALTER COLUMN current_price SET NOT NULL')
     except Exception:
-        # Если не получается, пробуем установить значение по умолчанию
         try:
             cur.execute('UPDATE alerts SET current_price = 0 WHERE current_price IS NULL')
             cur.execute('ALTER TABLE alerts ALTER COLUMN current_price SET NOT NULL')
@@ -119,18 +117,15 @@ def init_db():
     except Exception as e:
         print(f"⚠️ Не удалось добавить внешний ключ: {e}")
     
-    # === ИНДЕКСЫ (ТОЛЬКО ЕСЛИ КОЛОНКИ СУЩЕСТВУЮТ) ===
+    # === ИНДЕКСЫ ===
     try:
         cur.execute('CREATE INDEX IF NOT EXISTS idx_alerts_user_id ON alerts(user_id)')
     except Exception as e:
         print(f"⚠️ Ошибка индекса user_id: {e}")
-    
     try:
         cur.execute('CREATE INDEX IF NOT EXISTS idx_alerts_symbol ON alerts(symbol)')
     except Exception as e:
         print(f"⚠️ Ошибка индекса symbol: {e}")
-    
-    # Индекс на triggered — только если колонка существует
     try:
         cur.execute('CREATE INDEX IF NOT EXISTS idx_alerts_triggered ON alerts(triggered)')
     except psycopg2.errors.UndefinedColumn:
@@ -182,6 +177,115 @@ adapter = HTTPAdapter(max_retries=retry)
 session.mount('http://', adapter)
 session.mount('https://', adapter)
 
+# === КЭШ ВСЕХ ТИКЕРОВ BYBIT ===
+all_tickers_cache = {}
+all_tickers_cache_time = 0
+ALL_TICKERS_CACHE_TTL = 3600  # 1 час
+
+def update_all_tickers_cache():
+    """Обновляет кэш всех доступных тикеров Bybit."""
+    global all_tickers_cache, all_tickers_cache_time
+    now = time.time()
+    if now - all_tickers_cache_time < ALL_TICKERS_CACHE_TTL:
+        return
+    tickers = {}
+    # Категории для сканирования
+    for category in ['spot', 'linear', 'inverse']:
+        try:
+            url = f"https://api.bybit.com/v5/market/tickers?category={category}"
+            resp = session.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get('retCode') == 0 and 'result' in data and 'list' in data['result']:
+                    for t in data['result']['list']:
+                        symbol = t.get('symbol')
+                        if symbol:
+                            price = None
+                            if 'lastPrice' in t and t['lastPrice']:
+                                price = float(t['lastPrice'])
+                            elif 'markPrice' in t and t['markPrice']:
+                                price = float(t['markPrice'])
+                            elif 'indexPrice' in t and t['indexPrice']:
+                                price = float(t['indexPrice'])
+                            tickers[symbol.upper()] = {
+                                'symbol': symbol,
+                                'category': category,
+                                'price': price
+                            }
+        except Exception as e:
+            print(f"⚠️ Ошибка обновления кэша тикеров для {category}: {e}")
+    if tickers:
+        all_tickers_cache = tickers
+        all_tickers_cache_time = now
+        print(f"✅ Кэш тикеров обновлен: {len(tickers)} инструментов")
+
+def get_current_price(symbol):
+    try:
+        clean_symbol = symbol.upper().replace('/', '').replace('\\', '').replace('-', '').replace('_', '')
+        
+        # Варианты символов для поиска
+        symbol_variants = []
+        # Добавляем с USDT
+        if clean_symbol.endswith('USDT'):
+            symbol_variants.append(clean_symbol)
+            symbol_variants.append(clean_symbol[:-4])
+        else:
+            symbol_variants.append(f"{clean_symbol}USDT")
+            symbol_variants.append(clean_symbol)
+        # Добавляем с USDC
+        if clean_symbol.endswith('USDC'):
+            symbol_variants.append(clean_symbol)
+            symbol_variants.append(clean_symbol[:-4])
+        else:
+            symbol_variants.append(f"{clean_symbol}USDC")
+        # Убираем дубликаты
+        symbol_variants = list(set(symbol_variants))
+        
+        # Сначала точные запросы по категориям
+        categories = ['spot', 'linear', 'inverse']
+        for category in categories:
+            for sym in symbol_variants:
+                try:
+                    url = f"https://api.bybit.com/v5/market/tickers?category={category}&symbol={sym}"
+                    response = session.get(url, timeout=5)
+                    if response.status_code != 200:
+                        continue
+                    data = response.json()
+                    if data.get('retCode') == 0 and 'result' in data and 'list' in data['result']:
+                        tickers = data['result']['list']
+                        if tickers:
+                            ticker = tickers[0]
+                            if 'lastPrice' in ticker and ticker['lastPrice']:
+                                return float(ticker['lastPrice']), sym
+                            elif 'markPrice' in ticker and ticker['markPrice']:
+                                return float(ticker['markPrice']), sym
+                            elif 'indexPrice' in ticker and ticker['indexPrice']:
+                                return float(ticker['indexPrice']), sym
+                except:
+                    continue
+        
+        # Если не нашли точным запросом, используем кэш всех тикеров
+        update_all_tickers_cache()
+        # Поиск точного совпадения в кэше
+        for sym in symbol_variants:
+            if sym in all_tickers_cache:
+                info = all_tickers_cache[sym]
+                if info['price'] is not None:
+                    return info['price'], info['symbol']
+        # Поиск по базовому имени
+        base = clean_symbol.replace('USDT', '').replace('USDC', '')
+        for cached_sym, info in all_tickers_cache.items():
+            if cached_sym.startswith(base) and (cached_sym.endswith('USDT') or cached_sym.endswith('USDC')):
+                if info['price'] is not None:
+                    return info['price'], info['symbol']
+        
+        print(f"❌ Не удалось найти цену для {symbol}")
+        return None, symbol
+        
+    except Exception as e:
+        print(f"❌ Ошибка получения цены для {symbol}: {str(e)[:200]}")
+        return None, symbol
+
 def format_price(price):
     if price >= 1:
         return f"${price:,.2f}"
@@ -208,12 +312,10 @@ def add_alert(user_id, symbol, target_price, current_price, alert_type):
             VALUES (%s, NOW())
             ON CONFLICT (user_id) DO UPDATE SET last_activity = NOW()
         ''', (user_id,))
-        
         cur.execute('''
             INSERT INTO alerts (user_id, symbol, target_price, current_price, alert_type, triggered) 
             VALUES (%s, %s, %s, %s, %s, 0)
         ''', (user_id, symbol.upper(), target_price, current_price, alert_type))
-        
         conn.commit()
         print(f"✅ Добавлен алерт: {symbol} {alert_type} ${target_price}")
     except Exception as e:
@@ -228,18 +330,10 @@ def get_active_alerts():
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
     try:
-        cur.execute('''
-            SELECT id, user_id, symbol, target_price, alert_type 
-            FROM alerts 
-            WHERE triggered = 0
-        ''')
+        cur.execute('SELECT id, user_id, symbol, target_price, alert_type FROM alerts WHERE triggered = 0')
         rows = cur.fetchall()
     except psycopg2.errors.UndefinedColumn:
-        # Если колонки triggered нет, считаем все алерты активными (временно)
-        cur.execute('''
-            SELECT id, user_id, symbol, target_price, alert_type 
-            FROM alerts
-        ''')
+        cur.execute('SELECT id, user_id, symbol, target_price, alert_type FROM alerts')
         rows = cur.fetchall()
     finally:
         cur.close()
@@ -253,7 +347,7 @@ def mark_alert_triggered(alert_id):
         cur.execute('UPDATE alerts SET triggered = 1 WHERE id = %s', (alert_id,))
         conn.commit()
     except Exception as e:
-        print(f"⚠️ Не удалось пометить алтер {alert_id} как сработавший: {e}")
+        print(f"⚠️ Не удалось пометить алерт {alert_id} как сработавший: {e}")
         conn.rollback()
     finally:
         cur.close()
@@ -291,59 +385,6 @@ def get_all_alerts():
     cur.close()
     conn.close()
     return rows
-
-# === BYBIT API ===
-def get_current_price(symbol):
-    try:
-        clean_symbol = symbol.upper().replace('/', '').replace('\\', '').replace('-', '').replace('_', '')
-        symbol_variants = []
-        if clean_symbol.endswith('USDT'):
-            symbol_variants.append(clean_symbol)
-            symbol_variants.append(clean_symbol[:-4])
-        else:
-            symbol_variants.append(f"{clean_symbol}USDT")
-            symbol_variants.append(clean_symbol)
-        symbol_variants = list(set(symbol_variants))
-        for sym in symbol_variants:
-            try:
-                url = f"https://api.bybit.com/v5/market/tickers?category=spot&symbol={sym}"
-                response = session.get(url, timeout=5)
-                if response.status_code != 200:
-                    continue
-                data = response.json()
-                if data.get('retCode') == 0 and 'result' in data and 'list' in data['result']:
-                    tickers = data['result']['list']
-                    if tickers:
-                        ticker = tickers[0]
-                        if 'lastPrice' in ticker and ticker['lastPrice']:
-                            return float(ticker['lastPrice']), sym
-                        elif 'markPrice' in ticker and ticker['markPrice']:
-                            return float(ticker['markPrice']), sym
-                        elif 'indexPrice' in ticker and ticker['indexPrice']:
-                            return float(ticker['indexPrice']), sym
-            except:
-                continue
-        # Поиск по всем тикерам
-        try:
-            url = "https://api.bybit.com/v5/market/tickers?category=spot"
-            response = session.get(url, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('retCode') == 0 and 'result' in data and 'list' in data['result']:
-                    tickers = data['result']['list']
-                    for ticker in tickers:
-                        ticker_symbol = ticker.get('symbol', '').upper()
-                        for sym in symbol_variants:
-                            if sym in ticker_symbol or ticker_symbol.replace('USDT', '') == sym.replace('USDT', ''):
-                                if 'lastPrice' in ticker and ticker['lastPrice']:
-                                    return float(ticker['lastPrice']), ticker_symbol
-        except:
-            pass
-        print(f"❌ Не удалось найти цену для {symbol}")
-        return None, symbol
-    except Exception as e:
-        print(f"❌ Ошибка получения цены для {symbol}: {str(e)[:200]}")
-        return None, symbol
 
 def determine_alert_type(current_price, target_price):
     return "UP" if target_price > current_price else "DOWN"
@@ -551,7 +592,7 @@ def setup_bot_handlers(bot):
             cur.execute('SELECT COUNT(*) FROM alerts WHERE triggered = 0')
             active_alerts = cur.fetchone()[0]
         except psycopg2.errors.UndefinedColumn:
-            active_alerts = total_alerts  # fallback
+            active_alerts = total_alerts
         cur.close()
         conn.close()
         stats_text = f"""📊 СТАТИСТИКА БОТА:
