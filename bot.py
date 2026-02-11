@@ -22,7 +22,7 @@ print("=== БОТ ЗАПУЩЕН НА RAILWAY ===")
 TELEGRAM_BOT_TOKEN = '7791402185:AAHqmitReQZjuHl7ZHV2VzPXTyFT9BUXVyU'
 
 # ID администратора (ЗАМЕНИ НА СВОЙ ID)
-ADMIN_ID = 123456789  # ЗАМЕНИ НА СВОЙ TELEGRAM ID
+ADMIN_ID = 5870642170  # ЗАМЕНИ НА СВОЙ TELEGRAM ID
 
 # Файл блокировки для предотвращения запуска нескольких экземпляров
 LOCK_FILE = '/tmp/bot.lock'
